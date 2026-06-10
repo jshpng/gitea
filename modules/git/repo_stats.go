@@ -1,18 +1,18 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
 import (
 	"bufio"
-	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/git/gitcmd"
 )
 
 // CodeActivityStats represents git statistics data
@@ -33,53 +33,46 @@ type CodeActivityAuthor struct {
 	Commits int64
 }
 
-// GetCodeActivityStats returns code statistics for acitivity page
+// GetCodeActivityStats returns code statistics for activity page
 func (repo *Repository) GetCodeActivityStats(fromTime time.Time, branch string) (*CodeActivityStats, error) {
 	stats := &CodeActivityStats{}
 
 	since := fromTime.Format(time.RFC3339)
 
-	stdout, err := NewCommand("rev-list", "--count", "--no-merges", "--branches=*", "--date=iso", fmt.Sprintf("--since='%s'", since)).RunInDirBytes(repo.Path)
-	if err != nil {
-		return nil, err
+	stdout, _, runErr := gitcmd.NewCommand("rev-list", "--count", "--no-merges", "--branches=*", "--date=iso").
+		AddOptionFormat("--since=%s", since).
+		WithDir(repo.Path).
+		RunStdString(repo.Ctx)
+	if runErr != nil {
+		return nil, runErr
 	}
 
-	c, err := strconv.ParseInt(strings.TrimSpace(string(stdout)), 10, 64)
+	c, err := strconv.ParseInt(strings.TrimSpace(stdout), 10, 64)
 	if err != nil {
 		return nil, err
 	}
 	stats.CommitCountInAllBranches = c
 
-	stdoutReader, stdoutWriter, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = stdoutReader.Close()
-		_ = stdoutWriter.Close()
-	}()
-
-	args := []string{"log", "--numstat", "--no-merges", "--pretty=format:---%n%h%n%an%n%ae%n", "--date=iso", fmt.Sprintf("--since='%s'", since)}
+	gitCmd := gitcmd.NewCommand("log", "--numstat", "--no-merges", "--pretty=format:---%n%h%n%aN%n%aE%n", "--date=iso").
+		AddOptionFormat("--since=%s", since)
 	if len(branch) == 0 {
-		args = append(args, "--branches=*")
+		gitCmd.AddArguments("--branches=*")
 	} else {
-		args = append(args, "--first-parent", branch)
+		gitCmd.AddArguments("--first-parent").AddDynamicArguments(branch)
 	}
 
-	stderr := new(strings.Builder)
-	err = NewCommand(args...).RunInDirTimeoutEnvFullPipelineFunc(
-		nil, -1, repo.Path,
-		stdoutWriter, stderr, nil,
-		func(ctx context.Context, cancel context.CancelFunc) error {
-			_ = stdoutWriter.Close()
-
+	stdoutReader, stdoutReaderClose := gitCmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+	err = gitCmd.
+		WithDir(repo.Path).
+		WithPipelineFunc(func(ctx gitcmd.Context) error {
 			scanner := bufio.NewScanner(stdoutReader)
 			scanner.Split(bufio.ScanLines)
 			stats.CommitCount = 0
 			stats.Additions = 0
 			stats.Deletions = 0
 			authors := make(map[string]*CodeActivityAuthor)
-			files := make(map[string]bool)
+			files := make(container.Set[string])
 			var author string
 			p := 0
 			for scanner.Scan() {
@@ -103,11 +96,7 @@ func (repo *Repository) GetCodeActivityStats(fromTime time.Time, branch string) 
 				case 4: // E-mail
 					email := strings.ToLower(l)
 					if _, ok := authors[email]; !ok {
-						authors[email] = &CodeActivityAuthor{
-							Name:    author,
-							Email:   email,
-							Commits: 0,
-						}
+						authors[email] = &CodeActivityAuthor{Name: author, Email: email, Commits: 0}
 					}
 					authors[email].Commits++
 				default: // Changed file
@@ -122,13 +111,13 @@ func (repo *Repository) GetCodeActivityStats(fromTime time.Time, branch string) 
 								stats.Deletions += c
 							}
 						}
-						if _, ok := files[parts[2]]; !ok {
-							files[parts[2]] = true
-						}
+						files.Add(parts[2])
 					}
 				}
 			}
-
+			if err = scanner.Err(); err != nil {
+				return fmt.Errorf("GetCodeActivityStats scan: %w", err)
+			}
 			a := make([]*CodeActivityAuthor, 0, len(authors))
 			for _, v := range authors {
 				a = append(a, v)
@@ -137,16 +126,14 @@ func (repo *Repository) GetCodeActivityStats(fromTime time.Time, branch string) 
 			sort.Slice(a, func(i, j int) bool {
 				return a[i].Commits > a[j].Commits
 			})
-
 			stats.AuthorCount = int64(len(authors))
 			stats.ChangedFiles = int64(len(files))
 			stats.Authors = a
-
-			_ = stdoutReader.Close()
 			return nil
-		})
+		}).
+		RunWithStderr(repo.Ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get GetCodeActivityStats for repository.\nError: %w\nStderr: %s", err, stderr)
+		return nil, fmt.Errorf("GetCodeActivityStats: %w", err)
 	}
 
 	return stats, nil

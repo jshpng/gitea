@@ -1,164 +1,119 @@
 // Copyright 2017 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package cache
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
 
-	mc "gitea.com/macaron/cache"
-
-	_ "gitea.com/macaron/cache/memcache" // memcache plugin for cache
+	_ "gitea.com/go-chi/cache/memcache" //nolint:depguard // memcache plugin for cache, it is required for config "ADAPTER=memcache"
 )
 
-var (
-	conn mc.Cache
-)
+var defaultCache StringCache
 
-func newCache(cacheConfig setting.Cache) (mc.Cache, error) {
-	return mc.NewCacher(cacheConfig.Adapter, mc.Options{
-		Adapter:       cacheConfig.Adapter,
-		AdapterConfig: cacheConfig.Conn,
-		Interval:      cacheConfig.Interval,
-	})
-}
-
-// Cache is the interface that operates the cache data.
-type Cache interface {
-	// Put puts value into cache with key and expire time.
-	Put(key string, val interface{}, timeout int64) error
-	// Get gets cached value by given key.
-	Get(key string) interface{}
-	// Delete deletes cached value by given key.
-	Delete(key string) error
-	// Incr increases cached int-type value by given key as a counter.
-	Incr(key string) error
-	// Decr decreases cached int-type value by given key as a counter.
-	Decr(key string) error
-	// IsExist returns true if cached value exists.
-	IsExist(key string) bool
-	// Flush deletes all cached data.
-	Flush() error
-}
-
-// NewContext start cache service
-func NewContext() error {
-	var err error
-
-	if conn == nil && setting.CacheService.Enabled {
-		if conn, err = newCache(setting.CacheService.Cache); err != nil {
+// Init start cache service
+func Init() error {
+	if defaultCache == nil {
+		c, err := NewStringCache(setting.CacheService.Cache)
+		if err != nil {
 			return err
 		}
+		for range 10 {
+			if err = c.Ping(); err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if err != nil {
+			return err
+		}
+		defaultCache = c
+	}
+	return nil
+}
+
+const (
+	testCacheKey = "DefaultCache.TestKey"
+	// SlowCacheThreshold marks cache tests as slow
+	// set to 30ms per discussion: https://github.com/go-gitea/gitea/issues/33190
+	// TODO: Replace with metrics histogram
+	SlowCacheThreshold = 30 * time.Millisecond
+)
+
+// Test performs delete, put and get operations on a predefined key
+// returns
+func Test() (time.Duration, error) {
+	if defaultCache == nil {
+		return 0, errors.New("default cache not initialized")
 	}
 
-	return err
+	testData := hex.EncodeToString(make([]byte, 500))
+
+	start := time.Now()
+
+	if err := defaultCache.Delete(testCacheKey); err != nil {
+		return 0, fmt.Errorf("expect cache to delete data based on key if exist but got: %w", err)
+	}
+	if err := defaultCache.Put(testCacheKey, testData, 10); err != nil {
+		return 0, fmt.Errorf("expect cache to store data but got: %w", err)
+	}
+	testVal, hit := defaultCache.Get(testCacheKey)
+	if !hit {
+		return 0, errors.New("expect cache hit but got none")
+	}
+	if testVal != testData {
+		return 0, errors.New("expect cache to return same value as stored but got other")
+	}
+
+	return time.Since(start), nil
 }
 
 // GetCache returns the currently configured cache
-func GetCache() Cache {
-	return conn
+func GetCache() StringCache {
+	return defaultCache
 }
 
 // GetString returns the key value from cache with callback when no key exists in cache
 func GetString(key string, getFunc func() (string, error)) (string, error) {
-	if conn == nil || setting.CacheService.TTL == 0 {
+	if defaultCache == nil || setting.CacheService.TTL == 0 {
 		return getFunc()
 	}
-	if !conn.IsExist(key) {
-		var (
-			value string
-			err   error
-		)
-		if value, err = getFunc(); err != nil {
+	cached, exist := defaultCache.Get(key)
+	if !exist {
+		value, err := getFunc()
+		if err != nil {
 			return value, err
 		}
-		err = conn.Put(key, value, int64(setting.CacheService.TTL.Seconds()))
-		if err != nil {
-			return "", err
-		}
+		return value, defaultCache.Put(key, value, setting.CacheService.TTLSeconds())
 	}
-	value := conn.Get(key)
-	if v, ok := value.(string); ok {
-		return v, nil
-	}
-	if v, ok := value.(fmt.Stringer); ok {
-		return v.String(), nil
-	}
-	return fmt.Sprintf("%s", conn.Get(key)), nil
-}
-
-// GetInt returns key value from cache with callback when no key exists in cache
-func GetInt(key string, getFunc func() (int, error)) (int, error) {
-	if conn == nil || setting.CacheService.TTL == 0 {
-		return getFunc()
-	}
-	if !conn.IsExist(key) {
-		var (
-			value int
-			err   error
-		)
-		if value, err = getFunc(); err != nil {
-			return value, err
-		}
-		err = conn.Put(key, value, int64(setting.CacheService.TTL.Seconds()))
-		if err != nil {
-			return 0, err
-		}
-	}
-	switch value := conn.Get(key).(type) {
-	case int:
-		return value, nil
-	case string:
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return 0, err
-		}
-		return v, nil
-	default:
-		return 0, fmt.Errorf("Unsupported cached value type: %v", value)
-	}
+	return cached, nil
 }
 
 // GetInt64 returns key value from cache with callback when no key exists in cache
 func GetInt64(key string, getFunc func() (int64, error)) (int64, error) {
-	if conn == nil || setting.CacheService.TTL == 0 {
-		return getFunc()
+	s, err := GetString(key, func() (string, error) {
+		v, err := getFunc()
+		return strconv.FormatInt(v, 10), err
+	})
+	if err != nil {
+		return 0, err
 	}
-	if !conn.IsExist(key) {
-		var (
-			value int64
-			err   error
-		)
-		if value, err = getFunc(); err != nil {
-			return value, err
-		}
-		err = conn.Put(key, value, int64(setting.CacheService.TTL.Seconds()))
-		if err != nil {
-			return 0, err
-		}
+	if s == "" {
+		return 0, nil
 	}
-	switch value := conn.Get(key).(type) {
-	case int64:
-		return value, nil
-	case string:
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		return v, nil
-	default:
-		return 0, fmt.Errorf("Unsupported cached value type: %v", value)
-	}
+	return strconv.ParseInt(s, 10, 64)
 }
 
 // Remove key from cache
 func Remove(key string) {
-	if conn == nil {
+	if defaultCache == nil {
 		return
 	}
-	_ = conn.Delete(key)
+	_ = defaultCache.Delete(key)
 }

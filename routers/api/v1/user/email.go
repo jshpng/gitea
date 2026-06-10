@@ -1,6 +1,5 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package user
 
@@ -8,11 +7,12 @@ import (
 	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	user_service "gitea.dev/services/user"
 )
 
 // ListEmails list all of the authenticated user's email addresses
@@ -27,9 +27,9 @@ func ListEmails(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/EmailList"
 
-	emails, err := models.GetEmailAddresses(ctx.User.ID)
+	emails, err := user_model.GetEmailAddresses(ctx, ctx.Doer.ID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetEmailAddresses", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	apiEmails := make([]*api.Email, len(emails))
@@ -40,17 +40,12 @@ func ListEmails(ctx *context.APIContext) {
 }
 
 // AddEmail add an email address
-func AddEmail(ctx *context.APIContext, form api.CreateEmailOption) {
+func AddEmail(ctx *context.APIContext) {
 	// swagger:operation POST /user/emails user userAddEmail
 	// ---
 	// summary: Add email addresses
 	// produces:
 	// - application/json
-	// parameters:
-	// - name: options
-	//   in: body
-	//   schema:
-	//     "$ref": "#/definitions/CreateEmailOption"
 	// parameters:
 	// - name: body
 	//   in: body
@@ -62,41 +57,47 @@ func AddEmail(ctx *context.APIContext, form api.CreateEmailOption) {
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
+	form := web.GetForm(ctx).(*api.CreateEmailOption)
 	if len(form.Emails) == 0 {
-		ctx.Error(http.StatusUnprocessableEntity, "", "Email list empty")
+		ctx.APIError(http.StatusUnprocessableEntity, "Email list empty")
 		return
 	}
 
-	emails := make([]*models.EmailAddress, len(form.Emails))
-	for i := range form.Emails {
-		emails[i] = &models.EmailAddress{
-			UID:         ctx.User.ID,
-			Email:       form.Emails[i],
-			IsActivated: !setting.Service.RegisterEmailConfirm,
-		}
-	}
+	if err := user_service.AddEmailAddresses(ctx, ctx.Doer, form.Emails); err != nil {
+		if user_model.IsErrEmailAlreadyUsed(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, "Email address has been used: "+err.(user_model.ErrEmailAlreadyUsed).Email)
+		} else if user_model.IsErrEmailCharIsNotSupported(err) || user_model.IsErrEmailInvalid(err) {
+			email := ""
+			if typedError, ok := err.(user_model.ErrEmailInvalid); ok {
+				email = typedError.Email
+			}
+			if typedError, ok := err.(user_model.ErrEmailCharIsNotSupported); ok {
+				email = typedError.Email
+			}
 
-	if err := models.AddEmailAddresses(emails); err != nil {
-		if models.IsErrEmailAlreadyUsed(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", "Email address has been used: "+err.(models.ErrEmailAlreadyUsed).Email)
-		} else if models.IsErrEmailInvalid(err) {
-			errMsg := fmt.Sprintf("Email address %s invalid", err.(models.ErrEmailInvalid).Email)
-			ctx.Error(http.StatusUnprocessableEntity, "", errMsg)
+			errMsg := fmt.Sprintf("Email address %q invalid", email)
+			ctx.APIError(http.StatusUnprocessableEntity, errMsg)
 		} else {
-			ctx.Error(http.StatusInternalServerError, "AddEmailAddresses", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
 
-	apiEmails := make([]*api.Email, len(emails))
-	for i := range emails {
-		apiEmails[i] = convert.ToEmail(emails[i])
+	emails, err := user_model.GetEmailAddresses(ctx, ctx.Doer.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
 	}
-	ctx.JSON(http.StatusCreated, &apiEmails)
+
+	apiEmails := make([]*api.Email, 0, len(emails))
+	for _, email := range emails {
+		apiEmails = append(apiEmails, convert.ToEmail(email))
+	}
+	ctx.JSON(http.StatusCreated, apiEmails)
 }
 
 // DeleteEmail delete email
-func DeleteEmail(ctx *context.APIContext, form api.DeleteEmailOption) {
+func DeleteEmail(ctx *context.APIContext) {
 	// swagger:operation DELETE /user/emails user userDeleteEmail
 	// ---
 	// summary: Delete email addresses
@@ -110,22 +111,21 @@ func DeleteEmail(ctx *context.APIContext, form api.DeleteEmailOption) {
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
+	form := web.GetForm(ctx).(*api.DeleteEmailOption)
 	if len(form.Emails) == 0 {
 		ctx.Status(http.StatusNoContent)
 		return
 	}
 
-	emails := make([]*models.EmailAddress, len(form.Emails))
-	for i := range form.Emails {
-		emails[i] = &models.EmailAddress{
-			Email: form.Emails[i],
-			UID:   ctx.User.ID,
+	if err := user_service.DeleteEmailAddresses(ctx, ctx.Doer, form.Emails); err != nil {
+		if user_model.IsErrEmailAddressNotExist(err) {
+			ctx.APIError(http.StatusNotFound, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
 		}
-	}
-
-	if err := models.DeleteEmailAddresses(emails); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteEmailAddresses", err)
 		return
 	}
 	ctx.Status(http.StatusNoContent)

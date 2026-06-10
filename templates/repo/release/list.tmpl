@@ -1,191 +1,131 @@
 {{template "base/head" .}}
-<div class="page-content repository release">
+<div role="main" aria-label="{{.Title}}" class="page-content repository releases">
 	{{template "repo/header" .}}
 	<div class="ui container">
 		{{template "base/alert" .}}
-		<h2 class="ui compact small menu header">
-			{{if .Permission.CanRead $.UnitTypeReleases}}
-				<a class="{{if (not .PageIsTagList)}}active{{end}} item" href="{{.RepoLink}}/releases">{{.i18n.Tr "repo.release.releases"}}</a>
-			{{end}}
-			{{if .Permission.CanRead $.UnitTypeCode}}
-				<a class="{{if .PageIsTagList}}active{{end}} item" href="{{.RepoLink}}/tags">{{.i18n.Tr "repo.release.tags"}}</a>
-			{{end}}
-		</h2>
-		{{if (and .CanCreateRelease (not .PageIsTagList))}}
-			<a class="ui right small green button" href="{{$.RepoLink}}/releases/new">
-				{{.i18n.Tr "repo.release.new_release"}}
-			</a>
-		{{end}}
-		{{if .PageIsTagList}}
-		<div class="ui divider"></div>
-		{{if gt .ReleasesNum 0}}
-		<h4 class="ui top attached header">
-			<div class="five wide column df ac">
-				{{svg "octicon-tag" 16 "mr-2"}}{{.i18n.Tr "repo.release.tags"}}
-			</div>
-		</h4>
-		<div class="ui attached table segment">
-			<table class="ui very basic striped fixed table single line" id="tags-table">
-				<thead></thead>
-				<tbody class="tag-list">
-					{{range $idx, $release := .Releases}}
-						<tr>
-							<td class="tag">
-								<h3 class="release-tag-name mb-3">
-									<a class="df ac" href="{{$.RepoLink}}/src/tag/{{.TagName | EscapePound}}" rel="nofollow">{{.TagName}}</a>
-								</h3>
-								<div class="download df ac">
-									{{if $.Permission.CanRead $.UnitTypeCode}}
-										<a class="mr-3 mono" href="{{$.RepoLink}}/src/commit/{{.Sha1}}" rel="nofollow">{{svg "octicon-git-commit" 16 "mr-2"}}{{ShortSha .Sha1}}</a>
-										<a class="archive-link mr-3" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.zip" rel="nofollow">{{svg "octicon-file-zip" 16 "mr-2"}}ZIP</a>
-										<a class="archive-link mr-3" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.tar.gz">{{svg "octicon-file-zip" 16 "mr-2"}}TAR.GZ</a>
-										{{if (and $.CanCreateRelease $release.IsTag)}}
-											<a class="mr-3" href="{{$.RepoLink}}/releases/new?tag={{.TagName | EscapePound}}">{{svg "octicon-tag" 16 "mr-2"}}{{$.i18n.Tr "repo.release.new_release"}}</a>
-										{{end}}
-										{{if (and ($.Permission.CanWrite $.UnitTypeCode) $release.IsTag)}}
-											<a class="ui red delete-button mr-3" data-url="{{$.RepoLink}}/tags/delete" data-id="{{.ID}}">
-												{{svg "octicon-trashcan" 16 "mr-2"}}{{$.i18n.Tr "repo.release.delete_tag"}}
-											</a>
-										{{end}}
-										{{if (not $release.IsTag)}}
-											<a class="mr-3" href="{{$.RepoLink}}/releases/tag/{{.TagName | EscapePound}}">{{svg "octicon-tag" 16 "mr-2"}}{{$.i18n.Tr "repo.release.detail"}}</a>
-										{{end}}
-									{{end}}
-								</div>
-							</td>
-						</tr>
-					{{end}}
-				</tbody>
-			</table>
-		</div>
-		{{end}}
-		{{else}}
+		{{template "repo/release_tag_header" .}}
 		<ul id="release-list">
-			{{range $idx, $release := .Releases}}
-				<li class="ui grid">
-					<div class="ui four wide column meta mt-2">
-						{{if .IsTag}}
-							{{if .CreatedUnix}}<span class="time">{{TimeSinceUnix .CreatedUnix $.Lang}}</span>{{end}}
-						{{else}}
-							{{if .IsDraft}}
-								<span class="ui yellow label">{{$.i18n.Tr "repo.release.draft"}}</span>
-							{{else if .IsPrerelease}}
-								<span class="ui orange label">{{$.i18n.Tr "repo.release.prerelease"}}</span>
+			{{range $idx, $info := .Releases}}
+				{{$release := $info.Release}}
+				<li class="release-entry">
+					<div class="meta">
+						<a class="muted" href="{{if not (and $release.Sha1 ($.Permission.CanRead ctx.Consts.RepoUnitTypeCode))}}#{{else}}{{$.RepoLink}}/src/tag/{{$release.TagName | PathEscapeSegments}}{{end}}" rel="nofollow">{{svg "octicon-tag" 16 "tw-mr-1"}}{{$release.TagName}}</a>
+						{{if and $release.Sha1 ($.Permission.CanRead ctx.Consts.RepoUnitTypeCode)}}
+							<a class="muted tw-font-mono" href="{{$.RepoLink}}/src/commit/{{$release.Sha1}}" rel="nofollow">{{svg "octicon-git-commit" 16 "tw-mr-1"}}{{ShortSha $release.Sha1}}</a>
+							{{$compareTarget := ""}}
+							{{if $release.IsDraft}}
+									{{$compareTarget = $release.Target}}
+							{{else if $release.TagName}}
+									{{$compareTarget = $release.TagName}}
 							{{else}}
-								<span class="ui green label">{{$.i18n.Tr "repo.release.stable"}}</span>
+								{{$compareTarget = $release.Sha1}}
 							{{end}}
-							<span class="tag text blue">
-								<a class="df ac je" href="{{$.RepoLink}}/src/tag/{{.TagName | EscapePound}}" rel="nofollow">{{svg "octicon-tag" 16 "mr-2"}}{{.TagName}}</a>
-							</span>
-							<span class="commit">
-								<a class="mono" href="{{$.RepoLink}}/src/commit/{{.Sha1}}" rel="nofollow">{{svg "octicon-git-commit" 16 "mr-2"}}{{ShortSha .Sha1}}</a>
-							</span>
+							{{template "repo/branch_dropdown" dict
+								"ContainerClasses" "release-branch-tag-selector"
+								"Repository" $.Repository
+								"ShowTabTags" true
+								"DropdownFixedText" (ctx.Locale.Tr "repo.release.compare")
+								"RefLinkTemplate" (print "{RepoLink}/compare/{RefShortName}" "..." (PathEscapeSegments $compareTarget))
+							}}
 						{{end}}
 					</div>
-					<div class="ui twelve wide column detail">
-						{{if .IsTag}}
-							<h4>
-								<a href="{{$.RepoLink}}/src/tag/{{.TagName | EscapePound}}" rel="nofollow">{{svg "octicon-tag" 16 "mr-2"}}{{.TagName}}</a>
+					<div class="ui segment detail">
+						<div class="flex-left-right tw-mb-2">
+							<h4 class="release-list-title tw-break-anywhere">
+								{{if $.PageIsSingleTag}}{{$release.Title}}{{else}}<a class="muted" href="{{$.RepoLink}}/releases/tag/{{$release.TagName | PathEscapeSegments}}">{{$release.Title}}</a>{{end}}
+								{{template "repo/commit_statuses" dict "Status" $info.CommitStatus "Statuses" $info.CommitStatuses "AdditionalClasses" "tw-flex"}}
+								{{template "repo/release/label" (dict "Release" $release)}}
 							</h4>
-							<p class="text grey">
-								{{ if gt .Publisher.ID 0 }}
-								<span class="author">
-									{{avatar .Publisher 20}}
-									<a href="{{AppSubUrl}}/{{.Publisher.Name}}">{{.Publisher.Name}}</a>
-								</span>
-								{{ end }}
-								<span class="ahead"><a href="{{$.RepoLink}}/compare/{{.TagName | EscapePound}}...{{.Target}}">{{$.i18n.Tr "repo.release.ahead.commits" .NumCommitsBehind | Str2html}}</a> {{$.i18n.Tr "repo.release.ahead.target" $.DefaultBranch}}</span>
-							</p>
-							<div class="download">
-							{{if $.Permission.CanRead $.UnitTypeCode}}
-								<a class="mono" href="{{$.RepoLink}}/src/commit/{{.Sha1}}" rel="nofollow">{{svg "octicon-git-commit" 16 "mr-2"}}{{ShortSha .Sha1}}</a>
-								<a class="archive-link" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.zip" rel="nofollow">{{svg "octicon-file-zip"}}&nbsp;ZIP</a>
-								<a class="archive-link" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.tar.gz">{{svg "octicon-file-zip"}}&nbsp;TAR.GZ</a>
-							{{end}}
-							</div>
-						{{else}}
-							<h4 class="release-list-title df ac">
-								<a href="{{$.RepoLink}}/releases/tag/{{.TagName | EscapePound}}">{{.Title}}</a>
-								{{if $.CanCreateRelease}}
-									<small class="ml-2">
-										(<a href="{{$.RepoLink}}/releases/edit/{{.TagName | EscapePound}}" rel="nofollow">{{$.i18n.Tr "repo.release.edit"}}</a>)
-									</small>
+							<div>
+								{{if and $.CanCreateRelease (not $.PageIsSingleTag)}}
+									<a class="muted" data-tooltip-content="{{ctx.Locale.Tr "repo.release.edit"}}" href="{{$.RepoLink}}/releases/edit/{{$release.TagName | PathEscapeSegments}}" rel="nofollow">
+										{{svg "octicon-pencil"}}
+									</a>
 								{{end}}
-							</h4>
-							<p class="text grey">
-								<span class="author">
-								{{if .OriginalAuthor}}
-									{{svg "octicon-mark-github" 16 "mr-2"}}{{.OriginalAuthor}}
-								{{else if .Publisher}}
-									{{avatar .Publisher 20}}
-									<a href="{{AppSubUrl}}/{{.Publisher.Name}}">{{.Publisher.GetDisplayName}}</a>
+							</div>
+						</div>
+						<p class="tw-text-text-light">
+							<span class="author">
+							{{if $release.OriginalAuthor}}
+								{{svg (MigrationIcon $release.Repo.GetOriginalURLHostname) 20 "tw-mr-1"}}{{$release.OriginalAuthor}}
+							{{else if $release.Publisher}}
+								{{ctx.AvatarUtils.Avatar $release.Publisher 20 "tw-mr-1"}}
+								{{if gt $release.PublisherID 0}}
+									<a href="{{$release.Publisher.HomeLink}}">{{$release.Publisher.GetDisplayName}}</a>
 								{{else}}
-									Ghost
+									{{$release.Publisher.GetDisplayName}}
 								{{end}}
-								</span>
-								<span class="released">
-									{{$.i18n.Tr "repo.released_this"}}
-								</span>
-								{{if .CreatedUnix}}
-									<span class="time">{{TimeSinceUnix .CreatedUnix $.Lang}}</span> | 
+							{{else}}
+								Ghost
+							{{end}}
+							</span>
+							<span class="released">
+								{{ctx.Locale.Tr "repo.released_this"}}
+							</span>
+							{{if $release.CreatedUnix}}
+								<span class="time">{{DateUtils.TimeSince $release.CreatedUnix}}</span>
+							{{end}}
+							{{if and (gt $release.NumCommits 0) (not $release.IsDraft) ($.Permission.CanRead ctx.Consts.RepoUnitTypeCode)}}
+								| <span class="ahead"><a href="{{$.RepoLink}}/compare/{{$release.TagName | PathEscapeSegments}}...{{$release.TargetBehind | PathEscapeSegments}}">{{ctx.Locale.Tr "repo.release.ahead.commits" $release.NumCommitsBehind}}</a> {{ctx.Locale.Tr "repo.release.ahead.target" $release.TargetBehind}}</span>
+							{{end}}
+						</p>
+						<div class="render-content markup">
+							{{$release.RenderedNote}}
+						</div>
+						<div class="divider"></div>
+						<details class="download" {{if eq $idx 0}}open{{end}}>
+							<summary>
+								{{ctx.Locale.Tr "repo.release.downloads"}}
+							</summary>
+							<ul class="ui divided list attachment-list">
+								{{range $att := $release.Attachments}}
+									<li class="item">
+										<a target="_blank" class="tw-flex-1 gt-ellipsis" rel="nofollow" download href="{{$att.DownloadURL}}">
+											<strong class="flex-text-inline">{{svg "octicon-package" 16 "download-icon"}}<span class="gt-ellipsis">{{$att.Name}}</span></strong>
+										</a>
+										<div class="attachment-right-info flex-text-inline">
+											<span class="tw-pl-5">{{$att.Size | FileSize}}</span>
+											<span class="flex-text-inline" data-tooltip-content="{{ctx.Locale.Tr "repo.release.download_count" (ctx.Locale.PrettyNumber $att.DownloadCount)}}">
+												{{svg "octicon-info"}}
+											</span>
+											<div class="tw-flex-1"></div>
+											{{DateUtils.TimeSince $att.CreatedUnix}}
+										</div>
+									</li>
 								{{end}}
-								<span class="ahead"><a href="{{$.RepoLink}}/compare/{{.TagName | EscapePound}}...{{.Target}}">{{$.i18n.Tr "repo.release.ahead.commits" .NumCommitsBehind | Str2html}}</a> {{$.i18n.Tr "repo.release.ahead.target" .Target}}</span>
-							</p>
-							<div class="markdown desc">
-								{{Str2html .Note}}
-							</div>
-							<div class="ui accordion download">
-								<h2 class="title {{if eq $idx 0}}active{{end}} df ac mb-0">
-									{{svg "octicon-triangle-right" 14 "dropdown icon"}}
-									{{$.i18n.Tr "repo.release.downloads"}}
-								</h2>
-								<div class="content {{if eq $idx 0}}active{{end}}">
-									<ul class="list">
-										{{if $.Permission.CanRead $.UnitTypeCode}}
-											<li>
-												<a class="archive-link" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.zip" rel="nofollow"><strong>{{svg "octicon-file-zip" 16 "mr-2"}}{{$.i18n.Tr "repo.release.source_code"}} (ZIP)</strong></a>
-											</li>
-											<li>
-												<a class="archive-link" data-url="{{$.RepoLink}}/archive/{{.TagName | EscapePound}}.tar.gz"><strong>{{svg "octicon-file-zip" 16 "mr-2"}}{{$.i18n.Tr "repo.release.source_code"}} (TAR.GZ)</strong></a>
-											</li>
-										{{end}}
-										{{if .Attachments}}
-											{{range .Attachments}}
-												<li>
-													<span class="ui text right poping up" data-content="{{$.i18n.Tr "repo.release.download_count" (.DownloadCount | PrettyNumber)}}">
-														{{svg "octicon-info"}}
-													</span>
-													<a target="_blank" rel="noopener noreferrer" href="{{.DownloadURL}}">
-														<strong><span class="ui image" title='{{.Name}}'>{{svg "octicon-package" 16 "mr-2"}}</span>{{.Name}}</strong>
-														<span class="ui text grey right">{{.Size | FileSize}}</span>
-													</a>
-												</li>
-											{{end}}
-										{{end}}
-									</ul>
-								</div>
-							</div>
-						{{end}}
-						<span class="dot">&nbsp;</span>
+								{{if and (not $.DisableDownloadSourceArchives) (not $release.IsDraft) ($.Permission.CanRead ctx.Consts.RepoUnitTypeCode)}}
+									<li class="item">
+										<a class="archive-link" download href="{{$.RepoLink}}/archive/{{$release.TagName | PathEscapeSegments}}.zip" rel="nofollow">
+											<strong class="flex-text-inline">{{svg "octicon-file-zip" 16 "download-icon"}}{{ctx.Locale.Tr "repo.release.source_code"}} (ZIP)</strong>
+										</a>
+									</li>
+									<li class="item">
+										<a class="archive-link" download href="{{$.RepoLink}}/archive/{{$release.TagName | PathEscapeSegments}}.tar.gz" rel="nofollow">
+											<strong class="flex-text-inline">{{svg "octicon-file-zip" 16 "download-icon"}}{{ctx.Locale.Tr "repo.release.source_code"}} (TAR.GZ)</strong>
+										</a>
+									</li>
+								{{end}}
+							</ul>
+						</details>
 					</div>
 				</li>
 			{{end}}
 		</ul>
-		{{end}}
+
 		{{template "base/paginate" .}}
 	</div>
 </div>
 
-{{if (and ($.Permission.CanWrite $.UnitTypeCode) .PageIsTagList)}}
-	<div class="ui small basic delete modal">
-		<div class="ui header">
-			{{svg "octicon-trashcan" 16 "mr-2"}}
-			{{.i18n.Tr "repo.release.delete_tag"}}
+{{if (and ($.Permission.CanWrite ctx.Consts.RepoUnitTypeCode) .PageIsTagList)}}
+	<div class="ui g-modal-confirm delete modal">
+		<div class="header">
+			{{svg "octicon-trash"}}
+			{{ctx.Locale.Tr "repo.release.delete_tag"}}
 		</div>
 		<div class="content">
-			<p>{{.i18n.Tr "repo.release.deletion_tag_desc"}}</p>
+			<p>{{ctx.Locale.Tr "repo.release.deletion_tag_desc"}}</p>
 		</div>
-		{{template "base/delete_modal_actions" .}}
+		{{template "base/modal_actions_confirm" .}}
 	</div>
 {{end}}
 

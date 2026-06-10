@@ -1,27 +1,47 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
-func (repo *Repository) getTree(id SHA1) (*Tree, error) {
-	gogitTree, err := repo.gogitRepo.TreeObject(id)
+import (
+	"errors"
+
+	"gitea.dev/modules/git/gitcmd"
+
+	"github.com/go-git/go-git/v5/plumbing"
+)
+
+func (repo *Repository) getTree(id ObjectID) (*Tree, error) {
+	gogitTree, err := repo.gogitRepo.TreeObject(plumbing.Hash(id.RawValue()))
 	if err != nil {
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return nil, ErrNotExist{
+				ID: id.String(),
+			}
+		}
 		return nil, err
 	}
 
 	tree := NewTree(repo, id)
-	tree.gogitTree = gogitTree
+	tree.resolvedGogitTreeObject = gogitTree
 	return tree, nil
 }
 
 // GetTree find the tree object in the repository.
 func (repo *Repository) GetTree(idStr string) (*Tree, error) {
-	if len(idStr) != 40 {
-		res, err := NewCommand("rev-parse", "--verify", idStr).RunInDir(repo.Path)
+	objectFormat, err := repo.GetObjectFormat()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(idStr) != objectFormat.FullLength() {
+		res, _, err := gitcmd.NewCommand("rev-parse", "--verify").
+			AddDynamicArguments(idStr).
+			WithDir(repo.Path).
+			RunStdString(repo.Ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -34,9 +54,9 @@ func (repo *Repository) GetTree(idStr string) (*Tree, error) {
 		return nil, err
 	}
 	resolvedID := id
-	commitObject, err := repo.gogitRepo.CommitObject(id)
+	commitObject, err := repo.gogitRepo.CommitObject(plumbing.Hash(id.RawValue()))
 	if err == nil {
-		id = SHA1(commitObject.TreeHash)
+		id = ParseGogitHash(commitObject.TreeHash)
 	}
 	treeObject, err := repo.getTree(id)
 	if err != nil {

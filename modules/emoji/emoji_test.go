@@ -1,19 +1,18 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
 // Copyright 2015 Kenneth Shaw
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package emoji
 
 import (
-	"reflect"
 	"testing"
-)
 
-func TestDumpInfo(t *testing.T) {
-	t.Logf("codes: %d", len(codeMap))
-	t.Logf("aliases: %d", len(aliasMap))
-}
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestLookup(t *testing.T) {
 	a := FromCode("\U0001f37a")
@@ -21,32 +20,30 @@ func TestLookup(t *testing.T) {
 	c := FromAlias(":beer:")
 	d := FromAlias("beer")
 
-	if !reflect.DeepEqual(a, b) {
-		t.Errorf("a and b should equal")
-	}
-	if !reflect.DeepEqual(b, c) {
-		t.Errorf("b and c should equal")
-	}
-	if !reflect.DeepEqual(c, d) {
-		t.Errorf("c and d should equal")
-	}
-	if !reflect.DeepEqual(a, d) {
-		t.Errorf("a and d should equal")
-	}
+	assert.Equal(t, a, b)
+	assert.Equal(t, b, c)
+	assert.Equal(t, c, d)
 
 	m := FromCode("\U0001f44d")
 	n := FromAlias(":thumbsup:")
 	o := FromAlias("+1")
 
-	if !reflect.DeepEqual(m, n) {
-		t.Errorf("m and n should equal")
-	}
-	if !reflect.DeepEqual(n, o) {
-		t.Errorf("n and o should equal")
-	}
-	if !reflect.DeepEqual(m, o) {
-		t.Errorf("m and o should equal")
-	}
+	assert.Equal(t, m, n)
+	assert.Equal(t, m, o)
+
+	defer test.MockVariableValue(&setting.UI.EnabledEmojisSet, container.SetOf("thumbsup"))()
+	defer globalVarsStore.Store(nil)
+	globalVarsStore.Store(nil)
+	a = FromCode("\U0001f37a")
+	c = FromAlias(":beer:")
+	m = FromCode("\U0001f44d")
+	n = FromAlias(":thumbsup:")
+	o = FromAlias("+1")
+	assert.Nil(t, a)
+	assert.Nil(t, c)
+	assert.NotNil(t, m)
+	assert.NotNil(t, n)
+	assert.Nil(t, o)
 }
 
 func TestReplacers(t *testing.T) {
@@ -60,8 +57,37 @@ func TestReplacers(t *testing.T) {
 
 	for i, x := range tests {
 		s := x.f(x.v)
-		if s != x.exp {
-			t.Errorf("test %d `%s` expected `%s`, got: `%s`", i, x.v, x.exp, s)
-		}
+		assert.Equalf(t, x.exp, s, "test %d `%s` expected `%s`, got: `%s`", i, x.v, x.exp, s)
+	}
+}
+
+func TestFindEmojiSubmatchIndex(t *testing.T) {
+	type testcase struct {
+		teststring string
+		expected   []int
+	}
+
+	testcases := []testcase{
+		{
+			"\U0001f44d",
+			[]int{0, len("\U0001f44d")},
+		},
+		{
+			"\U0001f44d +1 \U0001f44d \U0001f37a",
+			[]int{0, 4},
+		},
+		{
+			" \U0001f44d",
+			[]int{1, 1 + len("\U0001f44d")},
+		},
+		{
+			string([]byte{'\u0001'}) + "\U0001f44d",
+			[]int{1, 1 + len("\U0001f44d")},
+		},
+	}
+
+	for _, kase := range testcases {
+		actual := FindEmojiSubmatchIndex(kase.teststring)
+		assert.Equal(t, kase.expected, actual)
 	}
 }

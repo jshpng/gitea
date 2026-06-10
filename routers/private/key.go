@@ -1,63 +1,70 @@
 // Copyright 2018 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// Package private includes all internal routes. The package name internal is ideal but Golang is not allowed, so we use private as package name instead.
 package private
 
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/timeutil"
-
-	"gitea.com/macaron/macaron"
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/modules/private"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/services/context"
 )
 
 // UpdatePublicKeyInRepo update public key and deploy key updates
-func UpdatePublicKeyInRepo(ctx *macaron.Context) {
-	keyID := ctx.ParamsInt64(":id")
-	repoID := ctx.ParamsInt64(":repoid")
-	if err := models.UpdatePublicKeyUpdated(keyID); err != nil {
-		ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"err": err.Error(),
+func UpdatePublicKeyInRepo(ctx *context.PrivateContext) {
+	keyID := ctx.PathParamInt64("id")
+	repoID := ctx.PathParamInt64("repoid")
+	if err := asymkey_model.UpdatePublicKeyUpdated(ctx, keyID); err != nil {
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err: err.Error(),
 		})
 		return
 	}
 
-	deployKey, err := models.GetDeployKeyByRepo(keyID, repoID)
+	deployKey, err := asymkey_model.GetDeployKeyByRepo(ctx, keyID, repoID)
 	if err != nil {
-		if models.IsErrDeployKeyNotExist(err) {
-			ctx.PlainText(200, []byte("success"))
+		if asymkey_model.IsErrDeployKeyNotExist(err) {
+			ctx.PlainText(http.StatusOK, "success")
 			return
 		}
-		ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"err": err.Error(),
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err: err.Error(),
 		})
 		return
 	}
 	deployKey.UpdatedUnix = timeutil.TimeStampNow()
-	if err = models.UpdateDeployKeyCols(deployKey, "updated_unix"); err != nil {
-		ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"err": err.Error(),
+	if err = asymkey_model.UpdateDeployKeyCols(ctx, deployKey, "updated_unix"); err != nil {
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err: err.Error(),
 		})
 		return
 	}
 
-	ctx.PlainText(http.StatusOK, []byte("success"))
+	ctx.PlainText(http.StatusOK, "success")
 }
 
-// AuthorizedPublicKeyByContent searches content as prefix (leak e-mail part)
+// AuthorizedPublicKeyByContent searches content as prefix (without comment part)
 // and returns public key found.
-func AuthorizedPublicKeyByContent(ctx *macaron.Context) {
-	content := ctx.Query("content")
+func AuthorizedPublicKeyByContent(ctx *context.PrivateContext) {
+	content := ctx.FormString("content")
 
-	publicKey, err := models.SearchPublicKeyByContent(content)
+	publicKey, err := asymkey_model.SearchPublicKeyByContent(ctx, content)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"err": err.Error(),
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err: err.Error(),
 		})
 		return
 	}
-	ctx.PlainText(http.StatusOK, []byte(publicKey.AuthorizedString()))
+
+	authorizedString, err := asymkey_model.AuthorizedStringForKey(publicKey)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err:     err.Error(),
+			UserMsg: "invalid public key",
+		})
+		return
+	}
+	ctx.PlainText(http.StatusOK, authorizedString)
 }

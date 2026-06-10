@@ -1,18 +1,17 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package private
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
 	"net/url"
-	"strconv"
-	"time"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
 )
 
 // Git environment variables
@@ -23,38 +22,28 @@ const (
 	GitPushOptionCount              = "GIT_PUSH_OPTION_COUNT"
 )
 
-// GitPushOptions is a wrapper around a map[string]string
-type GitPushOptions map[string]string
-
-// GitPushOptions keys
-const (
-	GitPushOptionRepoPrivate  = "repo.private"
-	GitPushOptionRepoTemplate = "repo.template"
-)
-
-// Bool checks for a key in the map and parses as a boolean
-func (g GitPushOptions) Bool(key string, def bool) bool {
-	if val, ok := g[key]; ok {
-		if b, err := strconv.ParseBool(val); err == nil {
-			return b
-		}
-	}
-	return def
-}
-
 // HookOptions represents the options for the Hook calls
 type HookOptions struct {
 	OldCommitIDs                    []string
 	NewCommitIDs                    []string
-	RefFullNames                    []string
+	RefFullNames                    []git.RefName
 	UserID                          int64
 	UserName                        string
 	GitObjectDirectory              string
 	GitAlternativeObjectDirectories string
 	GitQuarantinePath               string
 	GitPushOptions                  GitPushOptions
-	ProtectedBranchID               int64
-	IsDeployKey                     bool
+	PullRequestID                   int64
+	PushTrigger                     repository.PushTrigger
+	DeployKeyID                     int64 // if the pusher is a DeployKey, then UserID is the repo's org user.
+	IsWiki                          bool
+	ActionsTaskID                   int64 // if the pusher is an Actions user, the task ID
+}
+
+// SSHLogOption ssh log options
+type SSHLogOption struct {
+	IsError bool
+	Message string
 }
 
 // HookPostReceiveResult represents an individual result from PostReceive
@@ -72,75 +61,72 @@ type HookPostReceiveBranchResult struct {
 	URL     string
 }
 
+// HookProcReceiveResult represents an individual result from ProcReceive
+type HookProcReceiveResult struct {
+	Results []HookProcReceiveRefResult
+	Err     string
+}
+
+// HookProcReceiveRefResult represents an individual result from ProcReceive
+type HookProcReceiveRefResult struct {
+	OldOID            string
+	NewOID            string
+	Ref               string
+	OriginalRef       git.RefName
+	IsForcePush       bool
+	IsNotMatched      bool
+	Err               string
+	IsCreatePR        bool
+	URL               string
+	ShouldShowMessage bool
+	HeadBranch        string
+}
+
+func newInternalRequestAPIForHooks(ctx context.Context, hookName, ownerName, repoName string, opts HookOptions) *httplib.Request {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/%s/%s/%s", hookName, url.PathEscape(ownerName), url.PathEscape(repoName))
+	req := newInternalRequestAPI(ctx, reqURL, "POST", opts)
+	// This "timeout" applies to http.Client's timeout: A Timeout of zero means no timeout.
+	// This "timeout" was previously set to `time.Duration(60+len(opts.OldCommitIDs))` seconds, but it caused unnecessary timeout failures.
+	// It should be good enough to remove the client side timeout, only respect the "ctx" and server side timeout.
+	req.SetReadWriteTimeout(0)
+	return req
+}
+
 // HookPreReceive check whether the provided commits are allowed
-func HookPreReceive(ownerName, repoName string, opts HookOptions) (int, string) {
-	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/pre-receive/%s/%s",
-		url.PathEscape(ownerName),
-		url.PathEscape(repoName),
-	)
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-	jsonBytes, _ := json.Marshal(opts)
-	req.Body(jsonBytes)
-	req.SetTimeout(60*time.Second, time.Duration(60+len(opts.OldCommitIDs))*time.Second)
-	resp, err := req.Response()
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Sprintf("Unable to contact gitea: %v", err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, decodeJSONError(resp).Err
-	}
-
-	return http.StatusOK, ""
+func HookPreReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) ResponseExtra {
+	req := newInternalRequestAPIForHooks(ctx, "pre-receive", ownerName, repoName, opts)
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra
 }
 
 // HookPostReceive updates services and users
-func HookPostReceive(ownerName, repoName string, opts HookOptions) (*HookPostReceiveResult, string) {
-	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/post-receive/%s/%s",
-		url.PathEscape(ownerName),
-		url.PathEscape(repoName),
-	)
+func HookPostReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) (*HookPostReceiveResult, ResponseExtra) {
+	req := newInternalRequestAPIForHooks(ctx, "post-receive", ownerName, repoName, opts)
+	return requestJSONResp(req, &HookPostReceiveResult{})
+}
 
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-	req.SetTimeout(60*time.Second, time.Duration(60+len(opts.OldCommitIDs))*time.Second)
-	jsonBytes, _ := json.Marshal(opts)
-	req.Body(jsonBytes)
-	resp, err := req.Response()
-	if err != nil {
-		return nil, fmt.Sprintf("Unable to contact gitea: %v", err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, decodeJSONError(resp).Err
-	}
-	res := &HookPostReceiveResult{}
-	_ = json.NewDecoder(resp.Body).Decode(res)
-
-	return res, ""
+// HookProcReceive proc-receive hook
+func HookProcReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) (*HookProcReceiveResult, ResponseExtra) {
+	req := newInternalRequestAPIForHooks(ctx, "proc-receive", ownerName, repoName, opts)
+	return requestJSONResp(req, &HookProcReceiveResult{})
 }
 
 // SetDefaultBranch will set the default branch to the provided branch for the provided repository
-func SetDefaultBranch(ownerName, repoName, branch string) error {
+func SetDefaultBranch(ctx context.Context, ownerName, repoName, branch string) ResponseExtra {
 	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/set-default-branch/%s/%s/%s",
 		url.PathEscape(ownerName),
 		url.PathEscape(repoName),
 		url.PathEscape(branch),
 	)
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
+	req := newInternalRequestAPI(ctx, reqURL, "POST")
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra
+}
 
-	req.SetTimeout(60*time.Second, 60*time.Second)
-	resp, err := req.Response()
-	if err != nil {
-		return fmt.Errorf("Unable to contact gitea: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Error returned from gitea: %v", decodeJSONError(resp).Err)
-	}
-	return nil
+// SSHLog sends ssh error log response
+func SSHLog(ctx context.Context, isErr bool, msg string) error {
+	reqURL := setting.LocalURL + "api/internal/ssh/log"
+	req := newInternalRequestAPI(ctx, reqURL, "POST", &SSHLogOption{IsError: isErr, Message: msg})
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra.Error
 }

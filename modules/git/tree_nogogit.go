@@ -1,29 +1,22 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build !gogit
+//go:build !gogit
 
 package git
 
 import (
-	"strings"
+	"io"
+
+	"gitea.dev/modules/git/gitcmd"
 )
 
 // Tree represents a flat directory listing.
 type Tree struct {
-	ID         SHA1
-	ResolvedID SHA1
-	repo       *Repository
-
-	// parent tree
-	ptree *Tree
+	TreeCommon
 
 	entries       Entries
 	entriesParsed bool
-
-	entriesRecursive       Entries
-	entriesRecursiveParsed bool
 }
 
 // ListEntries returns all entries of current tree.
@@ -32,16 +25,54 @@ func (t *Tree) ListEntries() (Entries, error) {
 		return t.entries, nil
 	}
 
-	stdout, err := NewCommand("ls-tree", t.ID.String()).RunInDirBytes(t.repo.Path)
-	if err != nil {
-		if strings.Contains(err.Error(), "fatal: Not a valid object name") || strings.Contains(err.Error(), "fatal: not a tree object") {
+	if t.repo != nil {
+		batch, cancel, err := t.repo.CatFileBatch(t.repo.Ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer cancel()
+
+		info, rd, err := batch.QueryContent(t.ID.String())
+		if err != nil {
+			return nil, err
+		}
+
+		if info.Type == "commit" {
+			treeID, err := ReadTreeID(rd, info.Size)
+			if err != nil && err != io.EOF {
+				return nil, err
+			}
+			info, rd, err = batch.QueryContent(treeID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if info.Type == "tree" {
+			t.entries, err = catBatchParseTreeEntries(t.ID.Type(), t, rd, info.Size)
+			if err != nil {
+				return nil, err
+			}
+			t.entriesParsed = true
+			return t.entries, nil
+		}
+
+		// Not a tree just use ls-tree instead
+		if err := DiscardFull(rd, info.Size+1); err != nil {
+			return nil, err
+		}
+	}
+
+	stdout, _, runErr := gitcmd.NewCommand("ls-tree", "-l").AddDynamicArguments(t.ID.String()).WithDir(t.repo.Path).RunStdBytes(t.repo.Ctx)
+	if runErr != nil {
+		if gitcmd.IsStderr(runErr, gitcmd.StderrNotValidObjectName) || gitcmd.IsStderr(runErr, gitcmd.StderrNotTreeObject) {
 			return nil, ErrNotExist{
 				ID: t.ID.String(),
 			}
 		}
-		return nil, err
+		return nil, runErr
 	}
 
+	var err error
 	t.entries, err = parseTreeEntries(stdout, t)
 	if err == nil {
 		t.entriesParsed = true
@@ -50,20 +81,29 @@ func (t *Tree) ListEntries() (Entries, error) {
 	return t.entries, err
 }
 
-// ListEntriesRecursive returns all entries of current tree recursively including all subtrees
-func (t *Tree) ListEntriesRecursive() (Entries, error) {
-	if t.entriesRecursiveParsed {
-		return t.entriesRecursive, nil
-	}
-	stdout, err := NewCommand("ls-tree", "-t", "-r", t.ID.String()).RunInDirBytes(t.repo.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	t.entriesRecursive, err = parseTreeEntries(stdout, t)
-	if err == nil {
-		t.entriesRecursiveParsed = true
+// listEntriesRecursive returns all entries of current tree recursively including all subtrees
+// extraArgs could be "-l" to get the size, which is slower
+func (t *Tree) listEntriesRecursive(extraArgs gitcmd.TrustedCmdArgs) (Entries, error) {
+	stdout, _, runErr := gitcmd.NewCommand("ls-tree", "-t", "-r").
+		AddArguments(extraArgs...).
+		AddDynamicArguments(t.ID.String()).
+		WithDir(t.repo.Path).
+		RunStdBytes(t.repo.Ctx)
+	if runErr != nil {
+		return nil, runErr
 	}
 
-	return t.entriesRecursive, err
+	// FIXME: the "name" field is abused, here it is a full path
+	// FIXME: this ptree is not right, fortunately it isn't really used
+	return parseTreeEntries(stdout, t)
+}
+
+// ListEntriesRecursiveFast returns all entries of current tree recursively including all subtrees, no size
+func (t *Tree) ListEntriesRecursiveFast() (Entries, error) {
+	return t.listEntriesRecursive(nil)
+}
+
+// ListEntriesRecursiveWithSize returns all entries of current tree recursively including all subtrees, with size
+func (t *Tree) ListEntriesRecursiveWithSize() (Entries, error) {
+	return t.listEntriesRecursive(gitcmd.TrustedCmdArgs{"--long"})
 }

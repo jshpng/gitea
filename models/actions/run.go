@@ -1,0 +1,384 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package actions
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+	webhook_module "gitea.dev/modules/webhook"
+)
+
+// ActionRun represents a run of a workflow file
+type ActionRun struct {
+	ID                int64
+	Title             string
+	RepoID            int64                  `xorm:"unique(repo_index)"`
+	Repo              *repo_model.Repository `xorm:"-"`
+	OwnerID           int64                  `xorm:"index"`
+	WorkflowID        string                 `xorm:"index"`                    // the name of workflow file
+	Index             int64                  `xorm:"index unique(repo_index)"` // a unique number for each run of a repository
+	TriggerUserID     int64                  `xorm:"index"`
+	TriggerUser       *user_model.User       `xorm:"-"`
+	ScheduleID        int64
+	Ref               string `xorm:"index"` // the commit/tag/… that caused the run
+	IsRefDeleted      bool   `xorm:"-"`
+	CommitSHA         string
+	IsForkPullRequest bool                         // If this is triggered by a PR from a forked repository or an untrusted user, we need to check if it is approved and limit permissions when running the workflow.
+	NeedApproval      bool                         // may need approval if it's a fork pull request
+	ApprovedBy        int64                        `xorm:"index"` // who approved
+	Event             webhook_module.HookEventType // the webhook event that causes the workflow to run
+	EventPayload      string                       `xorm:"LONGTEXT"`
+	TriggerEvent      string                       // the trigger event defined in the `on` configuration of the triggered workflow
+	Status            Status                       `xorm:"index"`
+	Version           int                          `xorm:"version default 0"` // Status could be updated concomitantly, so an optimistic lock is needed
+	RawConcurrency    string                       // raw concurrency
+
+	// Started and Stopped are identical to the latest attempt after ActionRunAttempt was introduced.
+	// When a rerun creates a new latest attempt, they are reset until the new attempt starts and stops.
+	Started timeutil.TimeStamp
+	Stopped timeutil.TimeStamp
+
+	// PreviousDuration is kept only for legacy runs created before ActionRunAttempt existed.
+	// New runs and reruns no longer update this field and use attempt-scoped durations instead.
+	PreviousDuration time.Duration
+
+	LatestAttemptID int64 `xorm:"index NOT NULL DEFAULT 0"`
+
+	Created timeutil.TimeStamp `xorm:"created"`
+	Updated timeutil.TimeStamp `xorm:"updated"`
+}
+
+func init() {
+	db.RegisterModel(new(ActionRun))
+	db.RegisterModel(new(ActionRunIndex))
+}
+
+func (run *ActionRun) HTMLURL(ctxOpt ...context.Context) string {
+	if run.Repo == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/actions/runs/%d", run.Repo.HTMLURL(ctxOpt...), run.ID)
+}
+
+func (run *ActionRun) Link() string {
+	if run.Repo == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/actions/runs/%d", run.Repo.Link(), run.ID)
+}
+
+func (run *ActionRun) WorkflowLink() string {
+	if run.Repo == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/actions/?workflow=%s", run.Repo.Link(), run.WorkflowID)
+}
+
+// RefLink return the url of run's ref
+func (run *ActionRun) RefLink() string {
+	refName := git.RefName(run.Ref)
+	if refName.IsPull() {
+		return run.Repo.Link() + "/pulls/" + refName.ShortName()
+	}
+	return run.Repo.Link() + "/src/" + refName.RefWebLinkPath()
+}
+
+// PrettyRef return #id for pull ref or ShortName for others
+func (run *ActionRun) PrettyRef() string {
+	refName := git.RefName(run.Ref)
+	if refName.IsPull() {
+		return "#" + strings.TrimSuffix(strings.TrimPrefix(run.Ref, git.PullPrefix), "/head")
+	}
+	return refName.ShortName()
+}
+
+// RefTooltip return a tooltop of run's ref. For pull request, it's the title of the PR, otherwise it's the ShortName.
+func (run *ActionRun) RefTooltip() string {
+	payload, err := run.GetPullRequestEventPayload()
+	if err == nil && payload != nil && payload.PullRequest != nil {
+		return payload.PullRequest.Title
+	}
+	return git.RefName(run.Ref).ShortName()
+}
+
+// LoadAttributes load Repo TriggerUser if not loaded
+func (run *ActionRun) LoadAttributes(ctx context.Context) error {
+	if err := run.LoadRepo(ctx); err != nil {
+		return err
+	}
+
+	if err := run.Repo.LoadAttributes(ctx); err != nil {
+		return err
+	}
+
+	return run.LoadTriggerUser(ctx)
+}
+
+func (run *ActionRun) LoadTriggerUser(ctx context.Context) (err error) {
+	if run.TriggerUser != nil {
+		return nil
+	}
+	run.TriggerUserID, run.TriggerUser, err = user_model.GetPossibleUserByID(ctx, run.TriggerUserID)
+	return err
+}
+
+func (run *ActionRun) LoadRepo(ctx context.Context) error {
+	if run.Repo != nil {
+		return nil
+	}
+
+	repo, err := repo_model.GetRepositoryByID(ctx, run.RepoID)
+	if err != nil {
+		return err
+	}
+	run.Repo = repo
+	return nil
+}
+
+func (run *ActionRun) Duration() time.Duration {
+	d := calculateDuration(run.Started, run.Stopped, run.Status, run.Updated) + run.PreviousDuration
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// GetLatestAttempt returns
+//   - the latest attempt of the run
+//   - (nil, false, nil) for legacy runs that have no attempt records
+func (run *ActionRun) GetLatestAttempt(ctx context.Context) (*ActionRunAttempt, bool, error) {
+	if run.LatestAttemptID == 0 {
+		return nil, false, nil
+	}
+	attempt, err := GetRunAttemptByRepoAndID(ctx, run.RepoID, run.LatestAttemptID)
+	if err != nil {
+		return nil, false, err
+	}
+	return attempt, true, nil
+}
+
+func (run *ActionRun) GetEffectiveConcurrency(ctx context.Context) (string, bool, error) {
+	attempt, has, err := run.GetLatestAttempt(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if has {
+		return attempt.ConcurrencyGroup, attempt.ConcurrencyCancel, nil
+	}
+	return "", false, nil
+}
+
+func (run *ActionRun) GetPushEventPayload() (*api.PushPayload, error) {
+	if run.Event == webhook_module.HookEventPush {
+		var payload api.PushPayload
+		if err := json.Unmarshal([]byte(run.EventPayload), &payload); err != nil {
+			return nil, err
+		}
+		return &payload, nil
+	}
+	return nil, fmt.Errorf("event %s is not a push event", run.Event)
+}
+
+func (run *ActionRun) GetPullRequestEventPayload() (*api.PullRequestPayload, error) {
+	if run.Event.IsPullRequest() || run.Event.IsPullRequestReview() {
+		var payload api.PullRequestPayload
+		if err := json.Unmarshal([]byte(run.EventPayload), &payload); err != nil {
+			return nil, err
+		}
+		return &payload, nil
+	}
+	return nil, fmt.Errorf("event %s is not a pull request event", run.Event)
+}
+
+func (run *ActionRun) GetWorkflowRunEventPayload() (*api.WorkflowRunPayload, error) {
+	if run.Event == webhook_module.HookEventWorkflowRun {
+		var payload api.WorkflowRunPayload
+		if err := json.Unmarshal([]byte(run.EventPayload), &payload); err != nil {
+			return nil, err
+		}
+		return &payload, nil
+	}
+	return nil, fmt.Errorf("event %s is not a workflow run event", run.Event)
+}
+
+func (run *ActionRun) IsSchedule() bool {
+	return run.ScheduleID > 0
+}
+
+// UpdateRepoRunsNumbers updates the number of runs and closed runs of a repository.
+// Callers MUST invoke this from outside any transaction that has X-locked action_run rows for the same repo, otherwise, transaction deadlock
+func UpdateRepoRunsNumbers(ctx context.Context, repoID int64) {
+	if db.InTransaction(ctx) {
+		setting.PanicInDevOrTesting("UpdateRepoRunsNumbers must not be called inside a transaction")
+	}
+
+	e := db.GetEngine(ctx)
+
+	numActionRuns, err := e.Where("repo_id = ?", repoID).Count(new(ActionRun))
+	if err != nil {
+		log.Error("UpdateRepoRunsNumbers count num_action_runs for repo %d: %v", repoID, err)
+		return
+	}
+
+	numClosedActionRuns, err := e.Where("repo_id = ?", repoID).
+		In("status", StatusSuccess, StatusFailure, StatusCancelled, StatusSkipped).
+		Count(new(ActionRun))
+	if err != nil {
+		log.Error("UpdateRepoRunsNumbers count num_closed_action_runs for repo %d: %v", repoID, err)
+		return
+	}
+
+	if _, err := e.ID(repoID).Cols("num_action_runs", "num_closed_action_runs").NoAutoTime().Update(&repo_model.Repository{
+		NumActionRuns:       int(numActionRuns),
+		NumClosedActionRuns: int(numClosedActionRuns),
+	}); err != nil {
+		log.Error("UpdateRepoRunsNumbers update repo %d: %v", repoID, err)
+	}
+}
+
+func GetRunByRepoAndID(ctx context.Context, repoID, runID int64) (*ActionRun, error) {
+	var run ActionRun
+	has, err := db.GetEngine(ctx).Where("id=? AND repo_id=?", runID, repoID).Get(&run)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, fmt.Errorf("run with id %d: %w", runID, util.ErrNotExist)
+	}
+
+	return &run, nil
+}
+
+func GetRunByRepoAndIndex(ctx context.Context, repoID, runIndex int64) (*ActionRun, error) {
+	run := &ActionRun{
+		RepoID: repoID,
+		Index:  runIndex,
+	}
+	has, err := db.GetEngine(ctx).Get(run)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, fmt.Errorf("run with repo_id %d and index %d: %w", repoID, runIndex, util.ErrNotExist)
+	}
+
+	return run, nil
+}
+
+func GetLatestRun(ctx context.Context, repoID int64) (*ActionRun, error) {
+	run := &ActionRun{
+		RepoID: repoID,
+	}
+	has, err := db.GetEngine(ctx).Where("repo_id=?", repoID).Desc("index").Get(run)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, fmt.Errorf("latest run with repo_id %d: %w", repoID, util.ErrNotExist)
+	}
+	return run, nil
+}
+
+func GetWorkflowLatestRun(ctx context.Context, repoID int64, workflowFile, branch, event string) (*ActionRun, error) {
+	var run ActionRun
+	q := db.GetEngine(ctx).Where("repo_id=?", repoID).
+		And("ref = ?", branch).
+		And("workflow_id = ?", workflowFile)
+	if event != "" {
+		q.And("event = ?", event)
+	}
+	has, err := q.Desc("id").Get(&run)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, util.NewNotExistErrorf("run with repo_id %d, ref %s, workflow_id %s", repoID, branch, workflowFile)
+	}
+	return &run, nil
+}
+
+// UpdateRun updates a run.
+// It requires the inputted run has Version set.
+// It will return error if the version is not matched (it means the run has been changed after loaded).
+func UpdateRun(ctx context.Context, run *ActionRun, cols ...string) error {
+	sess := db.GetEngine(ctx).ID(run.ID)
+	if len(cols) > 0 {
+		sess.Cols(cols...)
+	}
+	run.Title = util.EllipsisDisplayString(run.Title, 255)
+	affected, err := sess.Update(run)
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("run has changed")
+		// It's impossible that the run is not found, since Gitea never deletes runs.
+	}
+
+	return nil
+}
+
+type ActionRunIndex db.ResourceIndex
+
+// GetConcurrentRunAttemptsAndJobs returns run attempts and jobs in the same concurrency group by statuses.
+func GetConcurrentRunAttemptsAndJobs(ctx context.Context, repoID int64, concurrencyGroup string, status []Status) ([]*ActionRunAttempt, []*ActionRunJob, error) {
+	attempts, err := FindConcurrentRunAttempts(ctx, repoID, concurrencyGroup, status)
+	if err != nil {
+		return nil, nil, fmt.Errorf("find run attempts: %w", err)
+	}
+
+	jobs, err := db.Find[ActionRunJob](ctx, &FindRunJobOptions{
+		RepoID:           repoID,
+		ConcurrencyGroup: concurrencyGroup,
+		Statuses:         status,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("find jobs: %w", err)
+	}
+
+	return attempts, jobs, nil
+}
+
+func CancelPreviousJobsByRunConcurrency(ctx context.Context, attempt *ActionRunAttempt) ([]*ActionRunJob, error) {
+	if attempt.ConcurrencyGroup == "" {
+		return nil, nil
+	}
+
+	var jobsToCancel []*ActionRunJob
+
+	statusFindOption := []Status{StatusWaiting, StatusBlocked}
+	if attempt.ConcurrencyCancel {
+		statusFindOption = append(statusFindOption, StatusRunning)
+		statusFindOption = append(statusFindOption, StatusCancelling)
+	}
+	attempts, jobs, err := GetConcurrentRunAttemptsAndJobs(ctx, attempt.RepoID, attempt.ConcurrencyGroup, statusFindOption)
+	if err != nil {
+		return nil, fmt.Errorf("find concurrent runs and jobs: %w", err)
+	}
+	jobsToCancel = append(jobsToCancel, jobs...)
+
+	// cancel runs in the same concurrency group
+	for _, concurrentAttempt := range attempts {
+		if concurrentAttempt.RunID == attempt.RunID {
+			continue
+		}
+		jobs, err := GetRunJobsByRunAndAttemptID(ctx, concurrentAttempt.RunID, concurrentAttempt.ID)
+		if err != nil {
+			return nil, fmt.Errorf("find run %d attempt %d jobs: %w", concurrentAttempt.RunID, concurrentAttempt.ID, err)
+		}
+		jobsToCancel = append(jobsToCancel, jobs...)
+	}
+
+	return CancelJobs(ctx, jobsToCancel)
+}

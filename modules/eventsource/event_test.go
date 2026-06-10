@@ -1,12 +1,14 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package eventsource
 
 import (
 	"bytes"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_wrapNewlines(t *testing.T) {
@@ -39,16 +41,10 @@ func Test_wrapNewlines(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			w := &bytes.Buffer{}
 			gotSum, err := wrapNewlines(w, []byte(tt.prefix), []byte(tt.value))
-			if err != nil {
-				t.Errorf("wrapNewlines() error = %v", err)
-				return
-			}
-			if gotSum != int64(len(tt.output)) {
-				t.Errorf("wrapNewlines() = %v, want %v", gotSum, int64(len(tt.output)))
-			}
-			if gotW := w.String(); gotW != tt.output {
-				t.Errorf("wrapNewlines() = %v, want %v", gotW, tt.output)
-			}
+			require.NoError(t, err)
+
+			assert.EqualValues(t, len(tt.output), gotSum)
+			assert.Equal(t, tt.output, w.String())
 		})
 	}
 }

@@ -1,16 +1,26 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package webhook
 
 import (
-	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/hostmatcher"
+	"gitea.dev/modules/setting"
+
+	_ "gitea.dev/models"
+	_ "gitea.dev/models/actions"
 )
 
 func TestMain(m *testing.M) {
-	models.MainTest(m, filepath.Join("..", ".."))
+	// for tests, allow only loopback IPs
+	setting.Webhook.AllowedHostList = hostmatcher.MatchBuiltinLoopback
+	unittest.MainTest(m, &unittest.TestOptions{
+		SetUp: func() error {
+			setting.LoadQueueSettings()
+			return Init()
+		},
+	})
 }

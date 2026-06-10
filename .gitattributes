@@ -1,6 +1,12 @@
 * text=auto eol=lf
+*.tmpl linguist-language=Handlebars
+*.pb.go linguist-generated
+/assets/*.json linguist-generated
+/public/assets/img/svg/*.svg linguist-generated
+/templates/swagger/v1_json.tmpl linguist-generated
+/templates/swagger/v1_openapi3_json.tmpl linguist-generated
+/options/fileicon/** linguist-generated
 /vendor/** -text -eol linguist-vendored
-/public/vendor/** -text -eol linguist-vendored
-/templates/**/*.tmpl linguist-language=Handlebars
-/.eslintrc linguist-language=YAML
-/.stylelintrc linguist-language=YAML
+/web_src/js/vendor/** -text -eol linguist-vendored
+Dockerfile.* linguist-language=Dockerfile
+Makefile.* linguist-language=Makefile

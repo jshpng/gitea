@@ -26,6 +26,7 @@
 
 ## Bibliography auxiliary files (bibtex/biblatex/biber):
 *.bbl
+*.bbl-SAVE-ERROR
 *.bcf
 *.blg
 *-blx.aux
@@ -39,6 +40,8 @@
 *.synctex.gz
 *.synctex.gz(busy)
 *.pdfsync
+*.rubbercache
+rubber.cache
 
 ## Build tool directories for auxiliary files
 # latexrun
@@ -111,15 +114,23 @@ acs-*.bib
 *.glsdefs
 *.lzo
 *.lzs
+*.slg
+*.slo
+*.sls
 
 # uncomment this for glossaries-extra (will ignore makeindex's style files!)
 # *.ist
+
+# gnuplot
+*.gnuplot
+*.table
 
 # gnuplottex
 *-gnuplottex-*
 
 # gregoriotex
 *.gaux
+*.glog
 *.gtex
 
 # htlatex
@@ -129,6 +140,9 @@ acs-*.bib
 *.lg
 *.trc
 *.xref
+
+# hypdoc
+*.hd
 
 # hyperref
 *.brf
@@ -166,6 +180,9 @@ _minted*
 # morewrites
 *.mw
 
+# newpax
+*.newpax
+
 # nomencl
 *.nlg
 *.nlo
@@ -184,6 +201,9 @@ _minted*
 
 # scrwfile
 *.wrt
+
+# svg
+svg-inkscape/
 
 # sympy
 *.sout
@@ -208,6 +228,9 @@ pythontex-files-*/
 *.dpth
 *.md5
 *.auxlock
+
+# titletoc
+*.ptc
 
 # todonotes
 *.tdo

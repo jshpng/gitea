@@ -1,154 +1,231 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package webhook
 
 import (
+	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models"
-	api "code.gitea.io/gitea/modules/structs"
+	webhook_model "gitea.dev/models/webhook"
+	"gitea.dev/modules/json"
+	api "gitea.dev/modules/structs"
+	webhook_module "gitea.dev/modules/webhook"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMatrixIssuesPayloadOpened(t *testing.T) {
-	p := issueTestPayload()
-	m := new(MatrixPayloadUnsafe)
-
-	p.Action = api.HookIssueOpened
-	pl, err := m.Issue(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Issue opened: [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] Issue opened: <a href=\"http://localhost:3000/test/repo/issues/2\">#2 crash</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-
-	p.Action = api.HookIssueClosed
-	pl, err = m.Issue(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Issue closed: [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] Issue closed: <a href=\"http://localhost:3000/test/repo/issues/2\">#2 crash</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-}
-
-func TestMatrixIssueCommentPayload(t *testing.T) {
-	p := issueCommentTestPayload()
-	m := new(MatrixPayloadUnsafe)
-
-	pl, err := m.IssueComment(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] New comment on issue [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] New comment on issue <a href=\"http://localhost:3000/test/repo/issues/2\">#2 crash</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-}
-
-func TestMatrixPullRequestCommentPayload(t *testing.T) {
-	p := pullRequestCommentTestPayload()
-	m := new(MatrixPayloadUnsafe)
-
-	pl, err := m.IssueComment(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] New comment on pull request [#2 Fix bug](http://localhost:3000/test/repo/pulls/2) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] New comment on pull request <a href=\"http://localhost:3000/test/repo/pulls/2\">#2 Fix bug</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-}
-
-func TestMatrixReleasePayload(t *testing.T) {
-	p := pullReleaseTestPayload()
-	m := new(MatrixPayloadUnsafe)
-
-	pl, err := m.Release(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Release created: [v1.0](http://localhost:3000/test/repo/src/v1.0) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] Release created: <a href=\"http://localhost:3000/test/repo/src/v1.0\">v1.0</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-}
-
-func TestMatrixPullRequestPayload(t *testing.T) {
-	p := pullRequestTestPayload()
-	m := new(MatrixPayloadUnsafe)
-
-	pl, err := m.PullRequest(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-
-	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Pull request opened: [#2 Fix bug](http://localhost:3000/test/repo/pulls/12) by [user1](https://try.gitea.io/user1)", pl.(*MatrixPayloadUnsafe).Body)
-	assert.Equal(t, "[<a href=\"http://localhost:3000/test/repo\">test/repo</a>] Pull request opened: <a href=\"http://localhost:3000/test/repo/pulls/12\">#2 Fix bug</a> by <a href=\"https://try.gitea.io/user1\">user1</a>", pl.(*MatrixPayloadUnsafe).FormattedBody)
-}
-
-func TestMatrixHookRequest(t *testing.T) {
-	h := &models.HookTask{
-		PayloadContent: `{
-  "body": "[[user1/test](http://localhost:3000/user1/test)] user1 pushed 1 commit to [master](http://localhost:3000/user1/test/src/branch/master):\n[5175ef2](http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee): Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n - user1",
-  "msgtype": "m.notice",
-  "format": "org.matrix.custom.html",
-  "formatted_body": "[\u003ca href=\"http://localhost:3000/user1/test\"\u003euser1/test\u003c/a\u003e] user1 pushed 1 commit to \u003ca href=\"http://localhost:3000/user1/test/src/branch/master\"\u003emaster\u003c/a\u003e:\u003cbr\u003e\u003ca href=\"http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee\"\u003e5175ef2\u003c/a\u003e: Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n - user1",
-  "io.gitea.commits": [
-    {
-      "id": "5175ef26201c58b035a3404b3fe02b4e8d436eee",
-      "message": "Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n",
-      "url": "http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee",
-      "author": {
-        "name": "user1",
-        "email": "user@mail.com",
-        "username": ""
-      },
-      "committer": {
-        "name": "user1",
-        "email": "user@mail.com",
-        "username": ""
-      },
-      "verification": null,
-      "timestamp": "0001-01-01T00:00:00Z",
-      "added": null,
-      "removed": null,
-      "modified": null
-    }
-  ],
-  "access_token": "dummy_access_token"
-}`,
+func TestMatrixPayload(t *testing.T) {
+	mc := matrixConvertor{
+		MsgType: "m.text",
 	}
 
-	wantPayloadContent := `{
-  "body": "[[user1/test](http://localhost:3000/user1/test)] user1 pushed 1 commit to [master](http://localhost:3000/user1/test/src/branch/master):\n[5175ef2](http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee): Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n - user1",
-  "msgtype": "m.notice",
-  "format": "org.matrix.custom.html",
-  "formatted_body": "[\u003ca href=\"http://localhost:3000/user1/test\"\u003euser1/test\u003c/a\u003e] user1 pushed 1 commit to \u003ca href=\"http://localhost:3000/user1/test/src/branch/master\"\u003emaster\u003c/a\u003e:\u003cbr\u003e\u003ca href=\"http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee\"\u003e5175ef2\u003c/a\u003e: Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n - user1",
-  "io.gitea.commits": [
-    {
-      "id": "5175ef26201c58b035a3404b3fe02b4e8d436eee",
-      "message": "Merge pull request 'Change readme.md' (#2) from add-matrix-webhook into master\n\nReviewed-on: http://localhost:3000/user1/test/pulls/2\n",
-      "url": "http://localhost:3000/user1/test/commit/5175ef26201c58b035a3404b3fe02b4e8d436eee",
-      "author": {
-        "name": "user1",
-        "email": "user@mail.com",
-        "username": ""
-      },
-      "committer": {
-        "name": "user1",
-        "email": "user@mail.com",
-        "username": ""
-      },
-      "verification": null,
-      "timestamp": "0001-01-01T00:00:00Z",
-      "added": null,
-      "removed": null,
-      "modified": null
-    }
-  ]
-}`
+	t.Run("Create", func(t *testing.T) {
+		p := createTestPayload()
 
-	req, err := getMatrixHookRequest(h)
+		pl, err := mc.Create(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo):[test](http://localhost:3000/test/repo/src/branch/test)] branch created by user1", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>:<a href="http://localhost:3000/test/repo/src/branch/test">test</a>] branch created by user1`, pl.FormattedBody)
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		p := deleteTestPayload()
+
+		pl, err := mc.Delete(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo):test] branch deleted by user1", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>:test] branch deleted by user1`, pl.FormattedBody)
+	})
+
+	t.Run("Fork", func(t *testing.T) {
+		p := forkTestPayload()
+
+		pl, err := mc.Fork(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[test/repo2](http://localhost:3000/test/repo2) is forked to [test/repo](http://localhost:3000/test/repo)", pl.Body)
+		assert.Equal(t, `<a href="http://localhost:3000/test/repo2">test/repo2</a> is forked to <a href="http://localhost:3000/test/repo">test/repo</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Push", func(t *testing.T) {
+		p := pushTestPayload()
+
+		pl, err := mc.Push(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] user1 pushed 2 commits to [test](http://localhost:3000/test/repo/src/branch/test):\n[2020558](http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778): commit message - user1\n[2020558](http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778): commit message - user1", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] user1 pushed 2 commits to <a href="http://localhost:3000/test/repo/src/branch/test">test</a>:<br><a href="http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778">2020558</a>: commit message - user1<br><a href="http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778">2020558</a>: commit message - user1`, pl.FormattedBody)
+	})
+
+	t.Run("Issue", func(t *testing.T) {
+		p := issueTestPayload()
+
+		p.Action = api.HookIssueOpened
+		pl, err := mc.Issue(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Issue opened: [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Issue opened: <a href="http://localhost:3000/test/repo/issues/2">#2 crash</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+
+		p.Action = api.HookIssueClosed
+		pl, err = mc.Issue(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Issue closed: [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Issue closed: <a href="http://localhost:3000/test/repo/issues/2">#2 crash</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("IssueComment", func(t *testing.T) {
+		p := issueCommentTestPayload()
+
+		pl, err := mc.IssueComment(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] New comment on issue [#2 crash](http://localhost:3000/test/repo/issues/2) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] New comment on issue <a href="http://localhost:3000/test/repo/issues/2">#2 crash</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("PullRequest", func(t *testing.T) {
+		p := pullRequestTestPayload()
+
+		pl, err := mc.PullRequest(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Pull request opened: [#12 Fix bug](http://localhost:3000/test/repo/pulls/12) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Pull request opened: <a href="http://localhost:3000/test/repo/pulls/12">#12 Fix bug</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("PullRequestComment", func(t *testing.T) {
+		p := pullRequestCommentTestPayload()
+
+		pl, err := mc.IssueComment(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] New comment on pull request [#12 Fix bug](http://localhost:3000/test/repo/pulls/12) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] New comment on pull request <a href="http://localhost:3000/test/repo/pulls/12">#12 Fix bug</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Review", func(t *testing.T) {
+		p := pullRequestTestPayload()
+		p.Action = api.HookIssueReviewed
+
+		pl, err := mc.Review(p, webhook_module.HookEventPullRequestReviewApproved)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Pull request review approved: [#12 Fix bug](http://localhost:3000/test/repo/pulls/12) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Pull request review approved: <a href="http://localhost:3000/test/repo/pulls/12">#12 Fix bug</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Repository", func(t *testing.T) {
+		p := repositoryTestPayload()
+
+		pl, err := mc.Repository(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, `[[test/repo](http://localhost:3000/test/repo)] Repository created by [user1](https://try.gitea.io/user1)`, pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Repository created by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Package", func(t *testing.T) {
+		p := packageTestPayload()
+
+		pl, err := mc.Package(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, `[[GiteaContainer](http://localhost:3000/user1/-/packages/container/GiteaContainer/latest)] Package published by [user1](https://try.gitea.io/user1)`, pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/user1/-/packages/container/GiteaContainer/latest">GiteaContainer</a>] Package published by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Wiki", func(t *testing.T) {
+		p := wikiTestPayload()
+
+		p.Action = api.HookWikiCreated
+		pl, err := mc.Wiki(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] New wiki page '[index](http://localhost:3000/test/repo/wiki/index)' (Wiki change comment) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] New wiki page '<a href="http://localhost:3000/test/repo/wiki/index">index</a>' (Wiki change comment) by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+
+		p.Action = api.HookWikiEdited
+		pl, err = mc.Wiki(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Wiki page '[index](http://localhost:3000/test/repo/wiki/index)' edited (Wiki change comment) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Wiki page '<a href="http://localhost:3000/test/repo/wiki/index">index</a>' edited (Wiki change comment) by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+
+		p.Action = api.HookWikiDeleted
+		pl, err = mc.Wiki(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Wiki page '[index](http://localhost:3000/test/repo/wiki/index)' deleted by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Wiki page '<a href="http://localhost:3000/test/repo/wiki/index">index</a>' deleted by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+
+	t.Run("Release", func(t *testing.T) {
+		p := pullReleaseTestPayload()
+
+		pl, err := mc.Release(p)
+		require.NoError(t, err)
+		require.NotNil(t, pl)
+
+		assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] Release created: [v1.0](http://localhost:3000/test/repo/releases/tag/v1.0) by [user1](https://try.gitea.io/user1)", pl.Body)
+		assert.Equal(t, `[<a href="http://localhost:3000/test/repo">test/repo</a>] Release created: <a href="http://localhost:3000/test/repo/releases/tag/v1.0">v1.0</a> by <a href="https://try.gitea.io/user1">user1</a>`, pl.FormattedBody)
+	})
+}
+
+func TestMatrixJSONPayload(t *testing.T) {
+	p := pushTestPayload()
+	data, err := p.JSONPayload()
 	require.NoError(t, err)
-	require.NotNil(t, req)
 
-	assert.Equal(t, "Bearer dummy_access_token", req.Header.Get("Authorization"))
-	assert.Equal(t, wantPayloadContent, h.PayloadContent)
+	hook := &webhook_model.Webhook{
+		RepoID:   3,
+		IsActive: true,
+		Type:     webhook_module.MATRIX,
+		URL:      "https://matrix.example.com/_matrix/client/r0/rooms/ROOM_ID/send/m.room.message",
+		Meta:     `{"message_type":0}`, // text
+	}
+	task := &webhook_model.HookTask{
+		HookID:         hook.ID,
+		EventType:      webhook_module.HookEventPush,
+		PayloadContent: string(data),
+		PayloadVersion: 2,
+	}
+
+	req, reqBody, err := newMatrixRequest(t.Context(), hook, task)
+	require.NotNil(t, req)
+	require.NotNil(t, reqBody)
+	require.NoError(t, err)
+
+	assert.Equal(t, "PUT", req.Method)
+	txnID, ok := strings.CutPrefix(req.URL.Path, "/_matrix/client/r0/rooms/ROOM_ID/send/m.room.message/")
+	assert.True(t, ok)
+	assert.Len(t, txnID, 40) // txnID is just a unique ID for a webhook request, it is a sha1 hash from the payload
+	assert.Equal(t, "sha256=", req.Header.Get("X-Hub-Signature-256"))
+	assert.Equal(t, "application/json", req.Header.Get("Content-Type"))
+	var body MatrixPayload
+	err = json.NewDecoder(req.Body).Decode(&body)
+	assert.NoError(t, err)
+	assert.Equal(t, "[[test/repo](http://localhost:3000/test/repo)] user1 pushed 2 commits to [test](http://localhost:3000/test/repo/src/branch/test):\n[2020558](http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778): commit message - user1\n[2020558](http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778): commit message - user1", body.Body)
 }
 
 func Test_getTxnID(t *testing.T) {

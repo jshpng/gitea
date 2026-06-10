@@ -1,11 +1,13 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package nosql
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestToRedisURI(t *testing.T) {
@@ -27,9 +29,9 @@ func TestToRedisURI(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ToRedisURI(tt.connection); got == nil || got.String() != tt.want {
-				t.Errorf(`ToRedisURI(%q) = %s, want %s`, tt.connection, got.String(), tt.want)
-			}
+			got := ToRedisURI(tt.connection)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want, got.String())
 		})
 	}
 }

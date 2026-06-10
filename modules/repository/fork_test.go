@@ -1,25 +1,25 @@
-// Copyright 2017 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
 
 package repository
 
 import (
 	"testing"
 
-	"code.gitea.io/gitea/models"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+
 	"github.com/stretchr/testify/assert"
 )
 
-func TestForkRepository(t *testing.T) {
-	assert.NoError(t, models.PrepareTestDatabase())
+func TestCanUserForkBetweenOwners(t *testing.T) {
+	defer test.MockVariableValue(&setting.Repository.AllowForkIntoSameOwner)
 
-	// user 13 has already forked repo10
-	user := models.AssertExistsAndLoadBean(t, &models.User{ID: 13}).(*models.User)
-	repo := models.AssertExistsAndLoadBean(t, &models.Repository{ID: 10}).(*models.Repository)
+	setting.Repository.AllowForkIntoSameOwner = true
+	assert.True(t, CanUserForkBetweenOwners(1, 1))
+	assert.True(t, CanUserForkBetweenOwners(1, 2))
 
-	fork, err := ForkRepository(user, user, repo, "test", "test")
-	assert.Nil(t, fork)
-	assert.Error(t, err)
-	assert.True(t, models.IsErrForkAlreadyExist(err))
+	setting.Repository.AllowForkIntoSameOwner = false
+	assert.False(t, CanUserForkBetweenOwners(1, 1))
+	assert.True(t, CanUserForkBetweenOwners(1, 2))
 }

@@ -1,22 +1,30 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package stats
 
 import (
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
+	"fmt"
+
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/languagestats"
+	"gitea.dev/modules/gitrepo"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/setting"
 )
 
 // DBIndexer implements Indexer interface to use database's like search
-type DBIndexer struct {
-}
+type DBIndexer struct{}
 
 // Index repository status function
 func (db *DBIndexer) Index(id int64) error {
-	repo, err := models.GetRepositoryByID(id)
+	ctx, _, finished := process.GetManager().AddContext(graceful.GetManager().ShutdownContext(), fmt.Sprintf("Stats.DB Index Repo[%d]", id))
+	defer finished()
+
+	repo, err := repo_model.GetRepositoryByID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -24,13 +32,16 @@ func (db *DBIndexer) Index(id int64) error {
 		return nil
 	}
 
-	status, err := repo.GetIndexerStatus(models.RepoIndexerTypeStats)
+	status, err := repo_model.GetIndexerStatus(ctx, repo, repo_model.RepoIndexerTypeStats)
 	if err != nil {
 		return err
 	}
 
-	gitRepo, err := git.OpenRepository(repo.RepoPath())
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
 	if err != nil {
+		if err.Error() == "no such file or directory" {
+			return nil
+		}
 		return err
 	}
 	defer gitRepo.Close()
@@ -38,7 +49,11 @@ func (db *DBIndexer) Index(id int64) error {
 	// Get latest commit for default branch
 	commitID, err := gitRepo.GetBranchCommitID(repo.DefaultBranch)
 	if err != nil {
-		log.Error("Unable to get commit ID for defaultbranch %s in %s", repo.DefaultBranch, repo.RepoPath())
+		if git.IsErrBranchNotExist(err) || git.IsErrNotExist(err) || setting.IsInTesting {
+			log.Debug("Unable to get commit ID for default branch %s in %s ... skipping this repository", repo.DefaultBranch, repo.FullName())
+			return nil
+		}
+		log.Error("Unable to get commit ID for default branch %s in %s. Error: %v", repo.DefaultBranch, repo.FullName(), err)
 		return err
 	}
 
@@ -48,12 +63,21 @@ func (db *DBIndexer) Index(id int64) error {
 	}
 
 	// Calculate and save language statistics to database
-	stats, err := gitRepo.GetLanguageStats(commitID)
+	stats, err := languagestats.GetLanguageStats(gitRepo, commitID)
 	if err != nil {
-		log.Error("Unable to get language stats for ID %s for defaultbranch %s in %s. Error: %v", commitID, repo.DefaultBranch, repo.RepoPath(), err)
+		if !setting.IsInTesting {
+			log.Error("Unable to get language stats for ID %s for default branch %s in %s. Error: %v", commitID, repo.DefaultBranch, repo.FullName(), err)
+		}
 		return err
 	}
-	return repo.UpdateLanguageStats(commitID, stats)
+	err = repo_model.UpdateLanguageStats(ctx, repo, commitID, stats)
+	if err != nil {
+		log.Error("Unable to update language stats for ID %s for default branch %s in %s. Error: %v", commitID, repo.DefaultBranch, repo.FullName(), err)
+		return err
+	}
+
+	log.Debug("DBIndexer completed language stats for ID %s for default branch %s in %s. stats count: %d", commitID, repo.DefaultBranch, repo.FullName(), len(stats))
+	return nil
 }
 
 // Close dummy function

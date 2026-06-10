@@ -1,17 +1,17 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package admin
 
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/cron"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/cron"
 )
 
 // ListCronTasks api for getting cron tasks
@@ -36,12 +36,10 @@ func ListCronTasks(ctx *context.APIContext) {
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
 	tasks := cron.ListTasks()
-	listOpts := utils.GetListOptions(ctx)
-	start, end := listOpts.GetStartEnd()
+	count := len(tasks)
 
-	if len(tasks) > listOpts.PageSize {
-		tasks = tasks[start:end]
-	}
+	listOpts := utils.GetListOptions(ctx)
+	tasks = util.PaginateSlice(tasks, listOpts.Page, listOpts.PageSize).(cron.TaskTable)
 
 	res := make([]structs.Cron, len(tasks))
 	for i, task := range tasks {
@@ -53,6 +51,8 @@ func ListCronTasks(ctx *context.APIContext) {
 			ExecTimes: task.ExecTimes,
 		}
 	}
+
+	ctx.SetTotalCountHeader(int64(count))
 	ctx.JSON(http.StatusOK, res)
 }
 
@@ -74,13 +74,13 @@ func PostCronTask(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-	task := cron.GetTask(ctx.Params(":task"))
+	task := cron.GetTask(ctx.PathParam("task"))
 	if task == nil {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 	task.Run()
-	log.Trace("Cron Task %s started by admin(%s)", task.Name, ctx.User.Name)
+	log.Trace("Cron Task %s started by admin(%s)", task.Name, ctx.Doer.Name)
 
 	ctx.Status(http.StatusNoContent)
 }

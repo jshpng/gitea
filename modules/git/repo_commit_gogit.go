@@ -1,23 +1,31 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
 import (
-	"fmt"
 	"strings"
 
+	"gitea.dev/modules/git/gitcmd"
+
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/hash"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
-// GetRefCommitID returns the last commit ID string of given reference (branch or tag).
+// GetRefCommitID returns the last commit ID string of given reference.
 func (repo *Repository) GetRefCommitID(name string) (string, error) {
-	ref, err := repo.gogitRepo.Reference(plumbing.ReferenceName(name), true)
+	if plumbing.IsHash(name) {
+		return name, nil
+	}
+	refName := plumbing.ReferenceName(name)
+	if err := refName.Validate(); err != nil {
+		return "", err
+	}
+	ref, err := repo.gogitRepo.Reference(refName, true)
 	if err != nil {
 		if err == plumbing.ErrReferenceNotFound {
 			return "", ErrNotExist{
@@ -30,51 +38,42 @@ func (repo *Repository) GetRefCommitID(name string) (string, error) {
 	return ref.Hash().String(), nil
 }
 
-// IsCommitExist returns true if given commit exists in current repository.
-func (repo *Repository) IsCommitExist(name string) bool {
-	hash := plumbing.NewHash(name)
-	_, err := repo.gogitRepo.CommitObject(hash)
-	return err == nil
+// ConvertToHash returns a Hash object from a potential ID string
+func (repo *Repository) ConvertToGitID(commitID string) (ObjectID, error) {
+	objectFormat, err := repo.GetObjectFormat()
+	if err != nil {
+		return nil, err
+	}
+	if len(commitID) == hash.HexSize && objectFormat.IsValid(commitID) {
+		ID, err := NewIDFromString(commitID)
+		if err == nil {
+			return ID, nil
+		}
+	}
+
+	actualCommitID, _, err := gitcmd.NewCommand("rev-parse", "--verify").
+		AddDynamicArguments(commitID).
+		WithDir(repo.Path).
+		RunStdString(repo.Ctx)
+	actualCommitID = strings.TrimSpace(actualCommitID)
+	if err != nil {
+		if strings.Contains(err.Error(), "unknown revision or path") ||
+			strings.Contains(err.Error(), "fatal: Needed a single revision") {
+			return objectFormat.EmptyObjectID(), ErrNotExist{commitID, ""}
+		}
+		return objectFormat.EmptyObjectID(), err
+	}
+
+	return NewIDFromString(actualCommitID)
 }
 
-func convertPGPSignatureForTag(t *object.Tag) *CommitGPGSignature {
-	if t.PGPSignature == "" {
-		return nil
-	}
-
-	var w strings.Builder
-	var err error
-
-	if _, err = fmt.Fprintf(&w,
-		"object %s\ntype %s\ntag %s\ntagger ",
-		t.Target.String(), t.TargetType.Bytes(), t.Name); err != nil {
-		return nil
-	}
-
-	if err = t.Tagger.Encode(&w); err != nil {
-		return nil
-	}
-
-	if _, err = fmt.Fprintf(&w, "\n\n"); err != nil {
-		return nil
-	}
-
-	if _, err = fmt.Fprintf(&w, t.Message); err != nil {
-		return nil
-	}
-
-	return &CommitGPGSignature{
-		Signature: t.PGPSignature,
-		Payload:   strings.TrimSpace(w.String()) + "\n",
-	}
-}
-
-func (repo *Repository) getCommit(id SHA1) (*Commit, error) {
+func (repo *Repository) getCommit(id ObjectID) (*Commit, error) {
 	var tagObject *object.Tag
 
-	gogitCommit, err := repo.gogitRepo.CommitObject(id)
+	commitID := plumbing.Hash(id.RawValue())
+	gogitCommit, err := repo.gogitRepo.CommitObject(commitID)
 	if err == plumbing.ErrObjectNotFound {
-		tagObject, err = repo.gogitRepo.TagObject(id)
+		tagObject, err = repo.gogitRepo.TagObject(commitID)
 		if err == plumbing.ErrObjectNotFound {
 			return nil, ErrNotExist{
 				ID: id.String(),
@@ -92,19 +91,13 @@ func (repo *Repository) getCommit(id SHA1) (*Commit, error) {
 	commit := convertCommit(gogitCommit)
 	commit.repo = repo
 
-	if tagObject != nil {
-		commit.CommitMessage = strings.TrimSpace(tagObject.Message)
-		commit.Author = &tagObject.Tagger
-		commit.Signature = convertPGPSignatureForTag(tagObject)
-	}
-
 	tree, err := gogitCommit.Tree()
 	if err != nil {
 		return nil, err
 	}
 
-	commit.Tree.ID = tree.Hash
-	commit.Tree.gogitTree = tree
+	commit.Tree.ID = ParseGogitHash(tree.Hash)
+	commit.Tree.resolvedGogitTreeObject = tree
 
 	return commit, nil
 }

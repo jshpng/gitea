@@ -1,128 +1,251 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package pull
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/notification"
-	"code.gitea.io/gitea/modules/setting"
-	issue_service "code.gitea.io/gitea/services/issue"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/organization"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/gitrepo"
+	"gitea.dev/modules/globallock"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	git_service "gitea.dev/services/git"
+	issue_service "gitea.dev/services/issue"
+	notify_service "gitea.dev/services/notify"
 )
 
+func getPullWorkingLockKey(prID int64) string {
+	return fmt.Sprintf("pull_working_%d", prID)
+}
+
+type NewPullRequestOptions struct {
+	Repo            *repo_model.Repository
+	Issue           *issues_model.Issue
+	LabelIDs        []int64
+	AttachmentUUIDs []string
+	PullRequest     *issues_model.PullRequest
+	AssigneeIDs     []int64
+	Reviewers       []*user_model.User
+	TeamReviewers   []*organization.Team
+	ProjectIDs      []int64
+}
+
 // NewPullRequest creates new pull request with labels for repository.
-func NewPullRequest(repo *models.Repository, pull *models.Issue, labelIDs []int64, uuids []string, pr *models.PullRequest, assigneeIDs []int64) error {
-	if err := TestPatch(pr); err != nil {
+func NewPullRequest(ctx context.Context, opts *NewPullRequestOptions) error {
+	repo, issue, labelIDs, uuids, pr, assigneeIDs := opts.Repo, opts.Issue, opts.LabelIDs, opts.AttachmentUUIDs, opts.PullRequest, opts.AssigneeIDs
+	if err := issue.LoadPoster(ctx); err != nil {
 		return err
 	}
 
-	divergence, err := GetDiverging(pr)
-	if err != nil {
-		return err
-	}
-	pr.CommitsAhead = divergence.Ahead
-	pr.CommitsBehind = divergence.Behind
-
-	if err := models.NewPullRequest(repo, pull, labelIDs, uuids, pr); err != nil {
-		return err
+	if user_model.IsUserBlockedBy(ctx, issue.Poster, repo.OwnerID) || user_model.IsUserBlockedBy(ctx, issue.Poster, assigneeIDs...) {
+		return user_model.ErrBlockedUser
 	}
 
-	for _, assigneeID := range assigneeIDs {
-		if err := issue_service.AddAssigneeIfNotAssigned(pull, pull.Poster, assigneeID); err != nil {
+	// user should be a collaborator or a member of the organization for base repo
+	canCreate := issue.Poster.IsAdmin || pr.Flow == issues_model.PullRequestFlowAGit
+	canAssignProject := canCreate
+	if !canCreate {
+		canCreate, err := repo_model.IsOwnerMemberCollaborator(ctx, repo, issue.Poster.ID)
+		if err != nil {
 			return err
 		}
+		canAssignProject = canCreate
+
+		if !canCreate {
+			// or user should have write permission in the head repo
+			if err := pr.LoadHeadRepo(ctx); err != nil {
+				return err
+			}
+			perm, err := access_model.GetDoerRepoPermission(ctx, pr.HeadRepo, issue.Poster)
+			if err != nil {
+				return err
+			}
+			if !perm.CanWrite(unit.TypeCode) {
+				return issues_model.ErrMustCollaborator
+			}
+			canAssignProject = perm.CanWrite(unit.TypeProjects)
+		}
 	}
 
-	pr.Issue = pull
-	pull.PullRequest = pr
-
-	if err := PushToBaseRepo(pr); err != nil {
+	if err := checkPullRequestBranchMergeable(ctx, pr); err != nil {
 		return err
 	}
 
-	mentions, err := pull.FindAndUpdateIssueMentions(models.DefaultDBContext(), pull.Poster, pull.Content)
-	if err != nil {
-		return err
-	}
-
-	notification.NotifyNewPullRequest(pr, mentions)
-	if len(pull.Labels) > 0 {
-		notification.NotifyIssueChangeLabels(pull.Poster, pull, pull.Labels, nil)
-	}
-	if pull.Milestone != nil {
-		notification.NotifyIssueChangeMilestone(pull.Poster, pull, 0)
-	}
-
-	// add first push codes comment
-	baseGitRepo, err := git.OpenRepository(pr.BaseRepo.RepoPath())
-	if err != nil {
-		return err
-	}
-	defer baseGitRepo.Close()
-
-	compareInfo, err := baseGitRepo.GetCompareInfo(pr.BaseRepo.RepoPath(),
-		git.BranchPrefix+pr.BaseBranch, pr.GetGitRefName())
-	if err != nil {
-		return err
-	}
-
-	if compareInfo.Commits.Len() > 0 {
-		data := models.PushActionContent{IsForcePush: false}
-		data.CommitIDs = make([]string, 0, compareInfo.Commits.Len())
-		for e := compareInfo.Commits.Back(); e != nil; e = e.Prev() {
-			data.CommitIDs = append(data.CommitIDs, e.Value.(*git.Commit).ID.String())
+	assigneeCommentMap := make(map[int64]*issues_model.Comment)
+	assignees := make(map[int64]*user_model.User)
+	var reviewNotifiers []*issue_service.ReviewRequestNotifier
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
+		if err := issues_model.NewPullRequest(ctx, repo, issue, labelIDs, uuids, pr); err != nil {
+			return err
 		}
 
-		dataJSON, err := json.Marshal(data)
+		for _, assigneeID := range assigneeIDs {
+			assignee, err := user_model.GetUserByID(ctx, assigneeID)
+			if err != nil {
+				log.Error("GetUserByID: %v", err)
+				continue
+			}
+			comment, err := issue_service.AddAssigneeIfNotAssigned(ctx, issue, issue.Poster, assignee)
+			if err != nil {
+				return err
+			}
+			assignees[assigneeID] = assignee
+			assigneeCommentMap[assigneeID] = comment
+		}
+
+		if len(opts.ProjectIDs) > 0 && canAssignProject {
+			if err := issues_model.IssueAssignOrRemoveProject(ctx, issue, issue.Poster, opts.ProjectIDs); err != nil {
+				return err
+			}
+		}
+
+		pr.Issue = issue
+		issue.PullRequest = pr
+
+		var err error
+		if pr.Flow == issues_model.PullRequestFlowGithub {
+			err = PushToBaseRepo(ctx, pr)
+		} else {
+			err = UpdateRef(ctx, pr)
+		}
 		if err != nil {
 			return err
 		}
 
-		ops := &models.CreateCommentOptions{
-			Type:        models.CommentTypePullPush,
-			Doer:        pull.Poster,
-			Repo:        repo,
-			Issue:       pr.Issue,
-			IsForcePush: false,
-			Content:     string(dataJSON),
+		// Update Commit Divergence
+		err = syncCommitDivergence(ctx, pr)
+		if err != nil {
+			return err
 		}
 
-		_, _ = models.CreateComment(ops)
+		// add first push codes comment
+		if _, _, err := CreatePushPullComment(ctx, issue.Poster, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false); err != nil {
+			return err
+		}
+
+		if !pr.IsWorkInProgress(ctx) {
+			reviewNotifiers, err = issue_service.PullRequestCodeOwnersReview(ctx, pr)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		// cleanup: this will only remove the reference, the real commit will be clean up when next GC
+		if err1 := gitrepo.RemoveRef(ctx, pr.BaseRepo, pr.GetGitHeadRefName()); err1 != nil {
+			log.Error("RemoveRef: %v", err1)
+		}
+		return err
+	}
+
+	issue_service.ReviewRequestNotify(ctx, issue, issue.Poster, reviewNotifiers)
+
+	// Request reviews, these should be requested before other notifications because they will add request reviews record
+	// on database
+	permDoer, err := access_model.GetDoerRepoPermission(ctx, repo, issue.Poster)
+	if err != nil {
+		return err
+	}
+	for _, reviewer := range opts.Reviewers {
+		if _, err = issue_service.ReviewRequest(ctx, pr.Issue, issue.Poster, &permDoer, reviewer, true); err != nil {
+			return err
+		}
+	}
+	for _, teamReviewer := range opts.TeamReviewers {
+		if _, err = issue_service.TeamReviewRequest(ctx, pr.Issue, issue.Poster, teamReviewer, true); err != nil {
+			return err
+		}
+	}
+
+	mentions, err := issues_model.FindAndUpdateIssueMentions(ctx, issue, issue.Poster, issue.Content)
+	if err != nil {
+		return err
+	}
+	notify_service.NewPullRequest(ctx, pr, mentions)
+	if len(issue.Labels) > 0 {
+		notify_service.IssueChangeLabels(ctx, issue.Poster, issue, issue.Labels, nil)
+	}
+	if issue.Milestone != nil {
+		notify_service.IssueChangeMilestone(ctx, issue.Poster, issue, 0)
+	}
+	for _, assignee := range assignees {
+		notify_service.IssueChangeAssignee(ctx, issue.Poster, issue, assignee, false, assigneeCommentMap[assignee.ID])
 	}
 
 	return nil
 }
 
+// ErrPullRequestHasMerged represents a "PullRequestHasMerged"-error
+type ErrPullRequestHasMerged struct {
+	ID         int64
+	IssueID    int64
+	HeadRepoID int64
+	BaseRepoID int64
+	HeadBranch string
+	BaseBranch string
+}
+
+// IsErrPullRequestHasMerged checks if an error is a ErrPullRequestHasMerged.
+func IsErrPullRequestHasMerged(err error) bool {
+	_, ok := err.(ErrPullRequestHasMerged)
+	return ok
+}
+
+// Error does pretty-printing :D
+func (err ErrPullRequestHasMerged) Error() string {
+	return fmt.Sprintf("pull request has merged [id: %d, issue_id: %d, head_repo_id: %d, base_repo_id: %d, head_branch: %s, base_branch: %s]",
+		err.ID, err.IssueID, err.HeadRepoID, err.BaseRepoID, err.HeadBranch, err.BaseBranch)
+}
+
 // ChangeTargetBranch changes the target branch of this pull request, as the given user.
-func ChangeTargetBranch(pr *models.PullRequest, doer *models.User, targetBranch string) (err error) {
+func ChangeTargetBranch(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.User, targetBranch string) (err error) {
+	releaser, err := globallock.Lock(ctx, getPullWorkingLockKey(pr.ID))
+	if err != nil {
+		log.Error("lock.Lock(): %v", err)
+		return fmt.Errorf("lock.Lock: %w", err)
+	}
+	defer releaser()
+
 	// Current target branch is already the same
 	if pr.BaseBranch == targetBranch {
 		return nil
 	}
 
 	if pr.Issue.IsClosed {
-		return models.ErrIssueIsClosed{
+		return issues_model.ErrIssueIsClosed{
 			ID:     pr.Issue.ID,
 			RepoID: pr.Issue.RepoID,
 			Index:  pr.Issue.Index,
+			IsPull: true,
 		}
 	}
 
 	if pr.HasMerged {
-		return models.ErrPullRequestHasMerged{
+		return ErrPullRequestHasMerged{
 			ID:         pr.ID,
 			IssueID:    pr.Index,
 			HeadRepoID: pr.HeadRepoID,
@@ -132,22 +255,33 @@ func ChangeTargetBranch(pr *models.PullRequest, doer *models.User, targetBranch 
 		}
 	}
 
+	exist, err := git_model.IsBranchExist(ctx, pr.BaseRepoID, targetBranch)
+	if err != nil {
+		return err
+	}
+	if !exist {
+		return git_model.ErrBranchNotExist{
+			RepoID:     pr.BaseRepoID,
+			BranchName: targetBranch,
+		}
+	}
+
 	// Check if branches are equal
-	branchesEqual, err := IsHeadEqualWithBranch(pr, targetBranch)
+	branchesEqual, err := IsHeadEqualWithBranch(ctx, pr, targetBranch)
 	if err != nil {
 		return err
 	}
 	if branchesEqual {
-		return models.ErrBranchesEqual{
+		return git_model.ErrBranchesEqual{
 			HeadBranchName: pr.HeadBranch,
 			BaseBranchName: targetBranch,
 		}
 	}
 
 	// Check if pull request for the new target branch already exists
-	existingPr, err := models.GetUnmergedPullRequest(pr.HeadRepoID, pr.BaseRepoID, pr.HeadBranch, targetBranch)
+	existingPr, err := issues_model.GetUnmergedPullRequest(ctx, pr.HeadRepoID, pr.BaseRepoID, pr.HeadBranch, targetBranch, issues_model.PullRequestFlowGithub)
 	if existingPr != nil {
-		return models.ErrPullRequestAlreadyExists{
+		return issues_model.ErrPullRequestAlreadyExists{
 			ID:         existingPr.ID,
 			IssueID:    existingPr.Index,
 			HeadRepoID: existingPr.HeadRepoID,
@@ -156,7 +290,7 @@ func ChangeTargetBranch(pr *models.PullRequest, doer *models.User, targetBranch 
 			BaseBranch: existingPr.BaseBranch,
 		}
 	}
-	if err != nil && !models.IsErrPullRequestNotExist(err) {
+	if err != nil && !issues_model.IsErrPullRequestNotExist(err) {
 		return err
 	}
 
@@ -165,56 +299,70 @@ func ChangeTargetBranch(pr *models.PullRequest, doer *models.User, targetBranch 
 	pr.BaseBranch = targetBranch
 
 	// Refresh patch
-	if err := TestPatch(pr); err != nil {
+	if err := checkPullRequestBranchMergeable(ctx, pr); err != nil {
 		return err
 	}
 
 	// Update target branch, PR diff and status
-	// This is the same as checkAndUpdateStatus in check service, but also updates base_branch
-	if pr.Status == models.PullRequestStatusChecking {
-		pr.Status = models.PullRequestStatusMergeable
+	// This is the same as markPullRequestAsMergeable in check service, but also updates base_branch
+	if pr.Status == issues_model.PullRequestStatusChecking {
+		pr.Status = issues_model.PullRequestStatusMergeable
 	}
 
-	// Update Commit Divergence
-	divergence, err := GetDiverging(pr)
-	if err != nil {
+	// add first push codes comment
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		// The UPDATE acquires the transaction lock, if the UPDATE succeeds, it should have updated one row (the "base_branch" is changed)
+		// If no row is updated, it means the PR has been merged or closed in the meantime
+		updated, err := pr.UpdateColsIfNotMerged(ctx, "merge_base", "status", "conflicted_files", "changed_protected_files", "base_branch")
+		if err != nil {
+			return err
+		}
+		if updated == 0 {
+			return util.ErrorWrap(util.ErrInvalidArgument, "pull request status has changed")
+		}
+
+		if err := syncCommitDivergence(ctx, pr); err != nil {
+			return fmt.Errorf("syncCommitDivergence: %w", err)
+		}
+
+		// Create comment
+		options := &issues_model.CreateCommentOptions{
+			Type:   issues_model.CommentTypeChangeTargetBranch,
+			Doer:   doer,
+			Repo:   pr.Issue.Repo,
+			Issue:  pr.Issue,
+			OldRef: oldBranch,
+			NewRef: targetBranch,
+		}
+		if _, err = issues_model.CreateComment(ctx, options); err != nil {
+			return fmt.Errorf("CreateChangeTargetBranchComment: %w", err)
+		}
+
+		// Delete all old push comments and insert new push comments
+		if _, err := db.GetEngine(ctx).Where("issue_id = ?", pr.IssueID).
+			And("type = ?", issues_model.CommentTypePullRequestPush).
+			NoAutoCondition().
+			Delete(new(issues_model.Comment)); err != nil {
+			return err
+		}
+
+		_, _, err = CreatePushPullComment(ctx, doer, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false)
 		return err
-	}
-	pr.CommitsAhead = divergence.Ahead
-	pr.CommitsBehind = divergence.Behind
-
-	if err := pr.UpdateColsIfNotMerged("merge_base", "status", "conflicted_files", "changed_protected_files", "base_branch", "commits_ahead", "commits_behind"); err != nil {
-		return err
-	}
-
-	// Create comment
-	options := &models.CreateCommentOptions{
-		Type:   models.CommentTypeChangeTargetBranch,
-		Doer:   doer,
-		Repo:   pr.Issue.Repo,
-		Issue:  pr.Issue,
-		OldRef: oldBranch,
-		NewRef: targetBranch,
-	}
-	if _, err = models.CreateComment(options); err != nil {
-		return fmt.Errorf("CreateChangeTargetBranchComment: %v", err)
-	}
-
-	return nil
+	})
 }
 
-func checkForInvalidation(requests models.PullRequestList, repoID int64, doer *models.User, branch string) error {
-	repo, err := models.GetRepositoryByID(repoID)
+func checkForInvalidation(ctx context.Context, requests issues_model.PullRequestList, repoID int64, doer *user_model.User, branch string) error {
+	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
 	if err != nil {
-		return fmt.Errorf("GetRepositoryByID: %v", err)
+		return fmt.Errorf("GetRepositoryByIDCtx: %w", err)
 	}
-	gitRepo, err := git.OpenRepository(repo.RepoPath())
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("git.OpenRepository: %v", err)
+		return fmt.Errorf("gitrepo.OpenRepository: %w", err)
 	}
 	go func() {
 		// FIXME: graceful: We need to tell the manager we're doing something...
-		err := requests.InvalidateCodeComments(doer, gitRepo, branch)
+		err := InvalidateCodeComments(ctx, requests, doer, repo, gitRepo, branch)
 		if err != nil {
 			log.Error("PullRequestList.InvalidateCodeComments: %v", err)
 		}
@@ -223,201 +371,217 @@ func checkForInvalidation(requests models.PullRequestList, repoID int64, doer *m
 	return nil
 }
 
+type TestPullRequestOptions struct {
+	RepoID      int64
+	Doer        *user_model.User
+	Branch      string
+	IsSync      bool // True means it's a pull request synchronization, false means it's triggered for pull request merging or updating
+	IsForcePush bool
+	OldCommitID string
+	NewCommitID string
+}
+
 // AddTestPullRequestTask adds new test tasks by given head/base repository and head/base branch,
 // and generate new patch for testing as needed.
-func AddTestPullRequestTask(doer *models.User, repoID int64, branch string, isSync bool, oldCommitID, newCommitID string) {
-	log.Trace("AddTestPullRequestTask [head_repo_id: %d, head_branch: %s]: finding pull requests", repoID, branch)
+func AddTestPullRequestTask(opts TestPullRequestOptions) {
+	log.Trace("AddTestPullRequestTask [head_repo_id: %d, head_branch: %s]: finding pull requests", opts.RepoID, opts.Branch)
 	graceful.GetManager().RunWithShutdownContext(func(ctx context.Context) {
-		// There is no sensible way to shut this down ":-("
-		// If you don't let it run all the way then you will lose data
-		// FIXME: graceful: AddTestPullRequestTask needs to become a queue!
-
-		prs, err := models.GetUnmergedPullRequestsByHeadInfo(repoID, branch)
+		// this function does a lot of operations to various models, if the process gets killed in the middle,
+		// there is no way to recover at the moment. The best workaround is to let end user push again.
+		repo, err := repo_model.GetRepositoryByID(ctx, opts.RepoID)
 		if err != nil {
-			log.Error("Find pull requests [head_repo_id: %d, head_branch: %s]: %v", repoID, branch, err)
+			log.Error("GetRepositoryByID: %v", err)
+			return
+		}
+		// GetUnmergedPullRequestsByHeadInfo() only return open and unmerged PR.
+		headBranchPRs, err := issues_model.GetUnmergedPullRequestsByHeadInfo(ctx, opts.RepoID, opts.Branch)
+		if err != nil {
+			log.Error("Find pull requests [head_repo_id: %d, head_branch: %s]: %v", opts.RepoID, opts.Branch, err)
 			return
 		}
 
-		if isSync {
-			requests := models.PullRequestList(prs)
-			if err = requests.LoadAttributes(); err != nil {
-				log.Error("PullRequestList.LoadAttributes: %v", err)
-			}
-			if invalidationErr := checkForInvalidation(requests, repoID, doer, branch); invalidationErr != nil {
-				log.Error("checkForInvalidation: %v", invalidationErr)
-			}
-			if err == nil {
-				for _, pr := range prs {
-					if newCommitID != "" && newCommitID != git.EmptySHA {
-						changed, err := checkIfPRContentChanged(pr, oldCommitID, newCommitID)
-						if err != nil {
-							log.Error("checkIfPRContentChanged: %v", err)
-						}
-						if changed {
-							// Mark old reviews as stale if diff to mergebase has changed
-							if err := models.MarkReviewsAsStale(pr.IssueID); err != nil {
-								log.Error("MarkReviewsAsStale: %v", err)
-							}
-						}
-						if err := models.MarkReviewsAsNotStale(pr.IssueID, newCommitID); err != nil {
-							log.Error("MarkReviewsAsNotStale: %v", err)
-						}
-						divergence, err := GetDiverging(pr)
-						if err != nil {
-							log.Error("GetDiverging: %v", err)
-						} else {
-							err = pr.UpdateCommitDivergence(divergence.Ahead, divergence.Behind)
-							if err != nil {
-								log.Error("UpdateCommitDivergence: %v", err)
-							}
-						}
-					}
-
-					pr.Issue.PullRequest = pr
-					notification.NotifyPullRequestSynchronized(doer, pr)
-				}
-			}
-		}
-
-		for _, pr := range prs {
+		for _, pr := range headBranchPRs {
 			log.Trace("Updating PR[%d]: composing new test task", pr.ID)
-			if err := PushToBaseRepo(pr); err != nil {
-				log.Error("PushToBaseRepo: %v", err)
+			pr.HeadRepo = repo // avoid loading again
+			if pr.Flow == issues_model.PullRequestFlowGithub {
+				if err := PushToBaseRepo(ctx, pr); err != nil {
+					log.Error("PushToBaseRepo: %v", err)
+					continue
+				}
+			} else {
 				continue
 			}
 
-			AddToTaskQueue(pr)
-			comment, err := models.CreatePushPullComment(doer, pr, oldCommitID, newCommitID)
-			if err == nil && comment != nil {
-				notification.NotifyPullRequestPushCommits(doer, pr, comment)
+			// create push comment before check pull request status,
+			// then when the status is mergeable, the comment is already in database, to make testing easy and stable
+			comment, commentCreated, err := CreatePushPullComment(ctx, opts.Doer, pr, opts.OldCommitID, opts.NewCommitID, opts.IsForcePush)
+			if err != nil {
+				log.Error("CreatePushPullComment: %v", err)
+			} else if commentCreated {
+				notify_service.PullRequestPushCommits(ctx, opts.Doer, pr, comment)
+			}
+			// The caller can be in a goroutine or a "push queue", "conflict check" can be time-consuming,
+			// and the concurrency should be limited, so the conflict check will be done in another queue
+			StartPullRequestCheckImmediately(ctx, pr)
+		}
+
+		if opts.IsSync {
+			if err = headBranchPRs.LoadAttributes(ctx); err != nil {
+				log.Error("PullRequestList.LoadAttributes: %v", err)
+			}
+			if invalidationErr := checkForInvalidation(ctx, headBranchPRs, opts.RepoID, opts.Doer, opts.Branch); invalidationErr != nil {
+				log.Error("checkForInvalidation: %v", invalidationErr)
+			}
+			if err == nil {
+				for _, pr := range headBranchPRs {
+					objectFormat := git.ObjectFormatFromName(pr.BaseRepo.ObjectFormatName)
+					if opts.NewCommitID != "" && opts.NewCommitID != objectFormat.EmptyObjectID().String() {
+						changed, newMergeBase, err := checkIfPRContentChanged(ctx, pr, opts.OldCommitID, opts.NewCommitID)
+						if err != nil {
+							log.Error("checkIfPRContentChanged: %v", err)
+						}
+						if newMergeBase != "" && pr.MergeBase != newMergeBase {
+							pr.MergeBase = newMergeBase
+							if _, err := pr.UpdateColsIfNotMerged(ctx, "merge_base"); err != nil {
+								log.Error("Update merge base for %-v: %v", pr, err)
+							}
+						}
+						if changed {
+							// Mark old reviews as stale if diff to mergebase has changed
+							if err := issues_model.MarkReviewsAsStale(ctx, pr.IssueID); err != nil {
+								log.Error("MarkReviewsAsStale: %v", err)
+							}
+
+							// dismiss all approval reviews if protected branch rule item enabled.
+							pb, err := git_model.GetFirstMatchProtectedBranchRule(ctx, pr.BaseRepoID, pr.BaseBranch)
+							if err != nil {
+								log.Error("GetFirstMatchProtectedBranchRule: %v", err)
+							}
+							if pb != nil && pb.DismissStaleApprovals {
+								if err := DismissApprovalReviews(ctx, opts.Doer, pr); err != nil {
+									log.Error("DismissApprovalReviews: %v", err)
+								}
+							}
+						}
+						if err := issues_model.MarkReviewsAsNotStale(ctx, pr.IssueID, opts.NewCommitID); err != nil {
+							log.Error("MarkReviewsAsNotStale: %v", err)
+						}
+						if err = syncCommitDivergence(ctx, pr); err != nil {
+							log.Error("syncCommitDivergence: %v", err)
+						}
+					}
+
+					if !pr.IsWorkInProgress(ctx) {
+						reviewNotifiers, err := issue_service.PullRequestCodeOwnersReview(ctx, pr)
+						if err != nil {
+							log.Error("PullRequestCodeOwnersReview: %v", err)
+						}
+						if len(reviewNotifiers) > 0 {
+							issue_service.ReviewRequestNotify(ctx, pr.Issue, opts.Doer, reviewNotifiers)
+						}
+					}
+
+					notify_service.PullRequestSynchronized(ctx, opts.Doer, pr, opts.OldCommitID, opts.NewCommitID)
+				}
 			}
 		}
 
-		log.Trace("AddTestPullRequestTask [base_repo_id: %d, base_branch: %s]: finding pull requests", repoID, branch)
-		prs, err = models.GetUnmergedPullRequestsByBaseInfo(repoID, branch)
+		log.Trace("AddTestPullRequestTask [base_repo_id: %d, base_branch: %s]: finding pull requests", opts.RepoID, opts.Branch)
+		// The base repositories of baseBranchPRs are the same one (opts.RepoID)
+		baseBranchPRs, err := issues_model.GetUnmergedPullRequestsByBaseInfo(ctx, opts.RepoID, opts.Branch)
 		if err != nil {
-			log.Error("Find pull requests [base_repo_id: %d, base_branch: %s]: %v", repoID, branch, err)
+			log.Error("Find pull requests [base_repo_id: %d, base_branch: %s]: %v", opts.RepoID, opts.Branch, err)
 			return
 		}
-		for _, pr := range prs {
-			divergence, err := GetDiverging(pr)
+		for _, pr := range baseBranchPRs {
+			pr.BaseRepo = repo // avoid loading again
+			err = syncCommitDivergence(ctx, pr)
 			if err != nil {
-				log.Error("GetDiverging: %v", err)
-			} else {
-				err = pr.UpdateCommitDivergence(divergence.Ahead, divergence.Behind)
-				if err != nil {
-					log.Error("UpdateCommitDivergence: %v", err)
+				if errors.Is(err, util.ErrNotExist) {
+					log.Warn("Cannot test PR %s/%d with base=%s head=%s: no longer exists", pr.BaseRepo.FullName(), pr.IssueID, pr.BaseBranch, pr.HeadBranch)
+				} else {
+					log.Error("syncCommitDivergence: %v", err)
 				}
+				continue
 			}
-			AddToTaskQueue(pr)
+			StartPullRequestCheckDelayable(ctx, pr)
 		}
 	})
 }
 
 // checkIfPRContentChanged checks if diff to target branch has changed by push
 // A commit can be considered to leave the PR untouched if the patch/diff with its merge base is unchanged
-func checkIfPRContentChanged(pr *models.PullRequest, oldCommitID, newCommitID string) (hasChanged bool, err error) {
-	if err = pr.LoadHeadRepo(); err != nil {
-		return false, fmt.Errorf("LoadHeadRepo: %v", err)
-	} else if pr.HeadRepo == nil {
-		// corrupt data assumed changed
-		return true, nil
-	}
-
-	if err = pr.LoadBaseRepo(); err != nil {
-		return false, fmt.Errorf("LoadBaseRepo: %v", err)
-	}
-
-	headGitRepo, err := git.OpenRepository(pr.HeadRepo.RepoPath())
+func checkIfPRContentChanged(ctx context.Context, pr *issues_model.PullRequest, oldCommitID, newCommitID string) (hasChanged bool, mergeBase string, err error) {
+	prCtx, cancel, err := createTemporaryRepoForPR(ctx, pr) // FIXME: why it still needs to create a temp repo, since the alongside calls like GetDiverging doesn't do so anymore
 	if err != nil {
-		return false, fmt.Errorf("OpenRepository: %v", err)
+		log.Error("CreateTemporaryRepoForPR %-v: %v", pr, err)
+		return false, "", err
 	}
-	defer headGitRepo.Close()
+	defer cancel()
 
-	// Add a temporary remote.
-	tmpRemote := "checkIfPRContentChanged-" + fmt.Sprint(time.Now().UnixNano())
-	if err = headGitRepo.AddRemote(tmpRemote, pr.BaseRepo.RepoPath(), true); err != nil {
-		return false, fmt.Errorf("AddRemote: %s/%s-%s: %v", pr.HeadRepo.OwnerName, pr.HeadRepo.Name, tmpRemote, err)
-	}
-	defer func() {
-		if err := headGitRepo.RemoveRemote(tmpRemote); err != nil {
-			log.Error("checkIfPRContentChanged: RemoveRemote: %s/%s-%s: %v", pr.HeadRepo.OwnerName, pr.HeadRepo.Name, tmpRemote, err)
-		}
-	}()
-	// To synchronize repo and get a base ref
-	_, base, err := headGitRepo.GetMergeBase(tmpRemote, pr.BaseBranch, pr.HeadBranch)
+	mergeBase, err = gitrepo.MergeBase(ctx, pr.BaseRepo, pr.BaseBranch, pr.GetGitHeadRefName())
 	if err != nil {
-		return false, fmt.Errorf("GetMergeBase: %v", err)
+		return false, "", fmt.Errorf("GetMergeBase: %w", err)
 	}
 
-	diffBefore := &bytes.Buffer{}
-	diffAfter := &bytes.Buffer{}
-	if err := headGitRepo.GetDiffFromMergeBase(base, oldCommitID, diffBefore); err != nil {
-		// If old commit not found, assume changed.
-		log.Debug("GetDiffFromMergeBase: %v", err)
-		return true, nil
-	}
-	if err := headGitRepo.GetDiffFromMergeBase(base, newCommitID, diffAfter); err != nil {
-		// New commit should be found
-		return false, fmt.Errorf("GetDiffFromMergeBase: %v", err)
-	}
+	cmd := gitcmd.NewCommand("diff", "--name-only", "-z").AddDynamicArguments(newCommitID, oldCommitID, mergeBase)
 
-	diffBeforeLines := bufio.NewScanner(diffBefore)
-	diffAfterLines := bufio.NewScanner(diffAfter)
-
-	for diffBeforeLines.Scan() && diffAfterLines.Scan() {
-		if strings.HasPrefix(diffBeforeLines.Text(), "index") && strings.HasPrefix(diffAfterLines.Text(), "index") {
-			// file hashes can change without the diff changing
-			continue
-		} else if strings.HasPrefix(diffBeforeLines.Text(), "@@") && strings.HasPrefix(diffAfterLines.Text(), "@@") {
-			// the location of the difference may change
-			continue
-		} else if !bytes.Equal(diffBeforeLines.Bytes(), diffAfterLines.Bytes()) {
-			return true, nil
+	stdoutReader, stdoutReaderClose := cmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+	if err := cmd.WithDir(prCtx.tmpBasePath).
+		WithPipelineFunc(func(ctx gitcmd.Context) error {
+			return util.IsEmptyReader(stdoutReader)
+		}).
+		RunWithStderr(ctx); err != nil {
+		if errors.Is(err, util.ErrNotEmpty) {
+			return true, mergeBase, nil
 		}
+
+		log.Error("Unable to run diff on %s %s %s in tempRepo for PR[%d]%s/%s...%s/%s: Error: %v",
+			newCommitID, oldCommitID, mergeBase,
+			pr.ID, pr.BaseRepo.FullName(), pr.BaseBranch, pr.HeadRepo.FullName(), pr.HeadBranch,
+			err)
+
+		return false, mergeBase, fmt.Errorf("Unable to run git diff --name-only -z %s %s %s: %w", newCommitID, oldCommitID, mergeBase, err)
 	}
 
-	if diffBeforeLines.Scan() || diffAfterLines.Scan() {
-		// Diffs not of equal length
-		return true, nil
-	}
-
-	return false, nil
+	return false, mergeBase, nil
 }
 
 // PushToBaseRepo pushes commits from branches of head repository to
 // corresponding branches of base repository.
 // FIXME: Only push branches that are actually updates?
-func PushToBaseRepo(pr *models.PullRequest) (err error) {
-	log.Trace("PushToBaseRepo[%d]: pushing commits to base repo '%s'", pr.BaseRepoID, pr.GetGitRefName())
+func PushToBaseRepo(ctx context.Context, pr *issues_model.PullRequest) (err error) {
+	return pushToBaseRepoHelper(ctx, pr, "")
+}
 
-	if err := pr.LoadHeadRepo(); err != nil {
+func pushToBaseRepoHelper(ctx context.Context, pr *issues_model.PullRequest, prefixHeadBranch string) (err error) {
+	log.Trace("PushToBaseRepo[%d]: pushing commits to base repo '%s'", pr.BaseRepoID, pr.GetGitHeadRefName())
+
+	if err := pr.LoadHeadRepo(ctx); err != nil {
 		log.Error("Unable to load head repository for PR[%d] Error: %v", pr.ID, err)
 		return err
 	}
-	headRepoPath := pr.HeadRepo.RepoPath()
 
-	if err := pr.LoadBaseRepo(); err != nil {
+	if err := pr.LoadBaseRepo(ctx); err != nil {
 		log.Error("Unable to load base repository for PR[%d] Error: %v", pr.ID, err)
 		return err
 	}
-	baseRepoPath := pr.BaseRepo.RepoPath()
 
-	if err = pr.LoadIssue(); err != nil {
-		return fmt.Errorf("unable to load issue %d for pr %d: %v", pr.IssueID, pr.ID, err)
+	if err = pr.LoadIssue(ctx); err != nil {
+		return fmt.Errorf("unable to load issue %d for pr %d: %w", pr.IssueID, pr.ID, err)
 	}
-	if err = pr.Issue.LoadPoster(); err != nil {
-		return fmt.Errorf("unable to load poster %d for pr %d: %v", pr.Issue.PosterID, pr.ID, err)
+	if err = pr.Issue.LoadPoster(ctx); err != nil {
+		return fmt.Errorf("unable to load poster %d for pr %d: %w", pr.Issue.PosterID, pr.ID, err)
 	}
 
-	gitRefName := pr.GetGitRefName()
+	gitRefName := pr.GetGitHeadRefName()
 
-	if err := git.Push(headRepoPath, git.PushOptions{
-		Remote: baseRepoPath,
-		Branch: pr.HeadBranch + ":" + gitRefName,
+	if err := gitrepo.Push(ctx, pr.HeadRepo, pr.BaseRepo, git.PushOptions{
+		Branch: prefixHeadBranch + pr.HeadBranch + ":" + gitRefName,
 		Force:  true,
 		// Use InternalPushingEnvironment here because we know that pre-receive and post-receive do not run on a refs/pulls/...
-		Env: models.InternalPushingEnvironment(pr.Issue.Poster, pr.BaseRepo),
+		Env: repo_module.InternalPushingEnvironment(pr.Issue.Poster, pr.BaseRepo),
 	}); err != nil {
 		if git.IsErrPushOutOfDate(err) {
 			// This should not happen as we're using force!
@@ -427,119 +591,223 @@ func PushToBaseRepo(pr *models.PullRequest) (err error) {
 			rejectErr := err.(*git.ErrPushRejected)
 			log.Info("Unable to push PR head for %s#%d (%-v:%s) due to rejection:\nStdout: %s\nStderr: %s\nError: %v", pr.BaseRepo.FullName(), pr.Index, pr.BaseRepo, gitRefName, rejectErr.StdOut, rejectErr.StdErr, rejectErr.Err)
 			return err
+		} else if git.IsErrMoreThanOne(err) {
+			if prefixHeadBranch != "" {
+				log.Info("Can't push with %s%s", prefixHeadBranch, pr.HeadBranch)
+				return err
+			}
+			log.Info("Retrying to push with %s%s", git.BranchPrefix, pr.HeadBranch)
+			err = pushToBaseRepoHelper(ctx, pr, git.BranchPrefix)
+			return err
 		}
 		log.Error("Unable to push PR head for %s#%d (%-v:%s) due to Error: %v", pr.BaseRepo.FullName(), pr.Index, pr.BaseRepo, gitRefName, err)
-		return fmt.Errorf("Push: %s:%s %s:%s %v", pr.HeadRepo.FullName(), pr.HeadBranch, pr.BaseRepo.FullName(), gitRefName, err)
+		return fmt.Errorf("Push: %s:%s %s:%s %w", pr.HeadRepo.FullName(), pr.HeadBranch, pr.BaseRepo.FullName(), gitRefName, err)
 	}
 
 	return nil
 }
 
-type errlist []error
-
-func (errs errlist) Error() string {
-	if len(errs) > 0 {
-		var buf strings.Builder
-		for i, err := range errs {
-			if i > 0 {
-				buf.WriteString(", ")
+// UpdatePullsRefs update all the PRs head file pointers like /refs/pull/1/head so that it will be dependent by other operations
+func UpdatePullsRefs(ctx context.Context, repo *repo_model.Repository, update *repo_module.PushUpdateOptions) {
+	branch := update.RefFullName.BranchName()
+	// GetUnmergedPullRequestsByHeadInfo() only return open and unmerged PR.
+	prs, err := issues_model.GetUnmergedPullRequestsByHeadInfo(ctx, repo.ID, branch)
+	if err != nil {
+		log.Error("Find pull requests [head_repo_id: %d, head_branch: %s]: %v", repo.ID, branch, err)
+	} else {
+		for _, pr := range prs {
+			log.Trace("Updating PR[%d]: composing new test task", pr.ID)
+			if pr.Flow == issues_model.PullRequestFlowGithub {
+				if err := PushToBaseRepo(ctx, pr); err != nil {
+					log.Error("PushToBaseRepo: %v", err)
+				}
 			}
-			buf.WriteString(err.Error())
 		}
-		return buf.String()
 	}
-	return ""
 }
 
-// CloseBranchPulls close all the pull requests who's head branch is the branch
-func CloseBranchPulls(doer *models.User, repoID int64, branch string) error {
-	prs, err := models.GetUnmergedPullRequestsByHeadInfo(repoID, branch)
+// UpdateRef update refs/pull/id/head directly for agit flow pull request
+func UpdateRef(ctx context.Context, pr *issues_model.PullRequest) (err error) {
+	log.Trace("UpdateRef[%d]: upgate pull request ref in base repo '%s'", pr.ID, pr.GetGitHeadRefName())
+	if err := pr.LoadBaseRepo(ctx); err != nil {
+		log.Error("Unable to load base repository for PR[%d] Error: %v", pr.ID, err)
+		return err
+	}
+
+	if err := gitrepo.UpdateRef(ctx, pr.BaseRepo, pr.GetGitHeadRefName(), pr.HeadCommitID); err != nil {
+		log.Error("Unable to update ref in base repository for PR[%d] Error: %v", pr.ID, err)
+	}
+
+	return err
+}
+
+// retargetBranchPulls change target branch for all pull requests whose base branch is the branch
+// Both branch and targetBranch must be in the same repo (for security reasons)
+func retargetBranchPulls(ctx context.Context, doer *user_model.User, repoID int64, branch, targetBranch string) error {
+	prs, err := issues_model.GetUnmergedPullRequestsByBaseInfo(ctx, repoID, branch)
 	if err != nil {
 		return err
 	}
 
-	prs2, err := models.GetUnmergedPullRequestsByBaseInfo(repoID, branch)
-	if err != nil {
+	if err := prs.LoadAttributes(ctx); err != nil {
 		return err
 	}
 
-	prs = append(prs, prs2...)
-	if err := models.PullRequestList(prs).LoadAttributes(); err != nil {
-		return err
-	}
-
-	var errs errlist
+	var errs []error
 	for _, pr := range prs {
-		if err = issue_service.ChangeStatus(pr.Issue, doer, true); err != nil && !models.IsErrPullWasClosed(err) {
+		if err = pr.Issue.LoadRepo(ctx); err != nil {
+			errs = append(errs, err)
+		} else if err = ChangeTargetBranch(ctx, pr, doer, targetBranch); err != nil &&
+			!issues_model.IsErrIssueIsClosed(err) && !IsErrPullRequestHasMerged(err) &&
+			!issues_model.IsErrPullRequestAlreadyExists(err) {
 			errs = append(errs, err)
 		}
 	}
-	if len(errs) > 0 {
-		return errs
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// CloseRepoBranchesPulls close all pull requests which head branches are in the given repository
-func CloseRepoBranchesPulls(doer *models.User, repo *models.Repository) error {
-	branches, err := git.GetBranchesByPath(repo.RepoPath())
+// AdjustPullsCausedByBranchDeleted close all the pull requests who's head branch is the branch
+// Or Close all the plls who's base branch is the branch if setting.Repository.PullRequest.RetargetChildrenOnMerge is false.
+// If it's true, Retarget all these pulls to the default branch.
+func AdjustPullsCausedByBranchDeleted(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, branch string) error {
+	// branch as head branch
+	prs, err := issues_model.GetUnmergedPullRequestsByHeadInfo(ctx, repo.ID, branch)
 	if err != nil {
 		return err
 	}
 
-	var errs errlist
-	for _, branch := range branches {
-		prs, err := models.GetUnmergedPullRequestsByHeadInfo(repo.ID, branch.Name)
-		if err != nil {
-			return err
-		}
+	if err := prs.LoadAttributes(ctx); err != nil {
+		return err
+	}
+	prs.SetHeadRepo(repo)
+	if err := prs.LoadRepositories(ctx); err != nil {
+		return err
+	}
 
-		if err = models.PullRequestList(prs).LoadAttributes(); err != nil {
-			return err
+	var errs []error
+	for _, pr := range prs {
+		if err = issue_service.CloseIssue(ctx, pr.Issue, doer, ""); err != nil && !issues_model.IsErrIssueIsClosed(err) && !issues_model.IsErrDependenciesLeft(err) {
+			errs = append(errs, err)
 		}
-
-		for _, pr := range prs {
-			if err = issue_service.ChangeStatus(pr.Issue, doer, true); err != nil && !models.IsErrPullWasClosed(err) {
+		if err == nil {
+			if err := issues_model.AddDeletePRBranchComment(ctx, doer, pr.BaseRepo, pr.Issue.ID, pr.HeadBranch); err != nil {
+				log.Error("AddDeletePRBranchComment: %v", err)
 				errs = append(errs, err)
 			}
 		}
 	}
 
-	if len(errs) > 0 {
-		return errs
+	if setting.Repository.PullRequest.RetargetChildrenOnMerge {
+		if err := retargetBranchPulls(ctx, doer, repo.ID, branch, repo.DefaultBranch); err != nil {
+			log.Error("retargetBranchPulls failed: %v", err)
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
 	}
-	return nil
+
+	// branch as base branch
+	prs, err = issues_model.GetUnmergedPullRequestsByBaseInfo(ctx, repo.ID, branch)
+	if err != nil {
+		return err
+	}
+
+	if err := prs.LoadAttributes(ctx); err != nil {
+		return err
+	}
+	prs.SetBaseRepo(repo)
+	if err := prs.LoadRepositories(ctx); err != nil {
+		return err
+	}
+
+	errs = nil
+	for _, pr := range prs {
+		if err = issues_model.AddDeletePRBranchComment(ctx, doer, pr.BaseRepo, pr.Issue.ID, pr.BaseBranch); err != nil {
+			log.Error("AddDeletePRBranchComment: %v", err)
+			errs = append(errs, err)
+		}
+		if err == nil {
+			if err = issue_service.CloseIssue(ctx, pr.Issue, doer, ""); err != nil && !issues_model.IsErrIssueIsClosed(err) && !issues_model.IsErrDependenciesLeft(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
+// CloseRepoBranchesPulls close all pull requests which head branches are in the given repository, but only whose base repo is not in the given repository
+func CloseRepoBranchesPulls(ctx context.Context, doer *user_model.User, repo *repo_model.Repository) error {
+	branches, _, err := gitrepo.GetBranchesByPath(ctx, repo, 0, 0)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, branch := range branches {
+		prs, err := issues_model.GetUnmergedPullRequestsByHeadInfo(ctx, repo.ID, branch)
+		if err != nil {
+			return err
+		}
+
+		if err = prs.LoadAttributes(ctx); err != nil {
+			return err
+		}
+
+		for _, pr := range prs {
+			// If the base repository for this pr is this repository there is no need to close it
+			// as it is going to be deleted anyway
+			if pr.BaseRepoID == repo.ID {
+				continue
+			}
+			if err = issue_service.CloseIssue(ctx, pr.Issue, doer, ""); err != nil && !issues_model.IsErrIssueIsClosed(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+var commitMessageTrailersPattern = regexp.MustCompile(`(?:^|\n\n)(?:[\w-]+[ \t]*:[^\n]+\n*(?:[ \t]+[^\n]+\n*)*)+$`)
+
 // GetSquashMergeCommitMessages returns the commit messages between head and merge base (if there is one)
-func GetSquashMergeCommitMessages(pr *models.PullRequest) string {
-	if err := pr.LoadIssue(); err != nil {
+func GetSquashMergeCommitMessages(ctx context.Context, pr *issues_model.PullRequest) string {
+	if err := pr.LoadIssue(ctx); err != nil {
 		log.Error("Cannot load issue %d for PR id %d: Error: %v", pr.IssueID, pr.ID, err)
 		return ""
 	}
 
-	if err := pr.Issue.LoadPoster(); err != nil {
+	if err := pr.Issue.LoadPoster(ctx); err != nil {
 		log.Error("Cannot load poster %d for pr id %d, index %d Error: %v", pr.Issue.PosterID, pr.ID, pr.Index, err)
 		return ""
 	}
 
 	if pr.HeadRepo == nil {
 		var err error
-		pr.HeadRepo, err = models.GetRepositoryByID(pr.HeadRepoID)
+		pr.HeadRepo, err = repo_model.GetRepositoryByID(ctx, pr.HeadRepoID)
 		if err != nil {
-			log.Error("GetRepositoryById[%d]: %v", pr.HeadRepoID, err)
+			log.Error("GetRepositoryByIdCtx[%d]: %v", pr.HeadRepoID, err)
 			return ""
 		}
 	}
 
-	gitRepo, err := git.OpenRepository(pr.HeadRepo.RepoPath())
+	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, pr.HeadRepo)
 	if err != nil {
 		log.Error("Unable to open head repository: Error: %v", err)
 		return ""
 	}
-	defer gitRepo.Close()
+	defer closer.Close()
 
-	headCommit, err := gitRepo.GetBranchCommit(pr.HeadBranch)
+	var headCommit *git.Commit
+	if pr.Flow == issues_model.PullRequestFlowGithub {
+		headCommit, err = gitRepo.GetBranchCommit(pr.HeadBranch)
+	} else {
+		pr.HeadCommitID, err = gitRepo.GetRefCommitID(pr.GetGitHeadRefName())
+		if err != nil {
+			log.Error("Unable to get head commit: %s Error: %v", pr.GetGitHeadRefName(), err)
+			return ""
+		}
+		headCommit, err = gitRepo.GetCommit(pr.HeadCommitID)
+	}
 	if err != nil {
 		log.Error("Unable to get head commit: %s Error: %v", pr.HeadBranch, err)
 		return ""
@@ -553,7 +821,7 @@ func GetSquashMergeCommitMessages(pr *models.PullRequest) string {
 
 	limit := setting.Repository.PullRequest.DefaultMergeMessageCommitsLimit
 
-	list, err := gitRepo.CommitsBetweenLimit(headCommit, mergeBase, limit, 0)
+	commits, err := gitRepo.CommitsBetweenLimit(headCommit, mergeBase, limit, 0)
 	if err != nil {
 		log.Error("Unable to get commits between: %s %s Error: %v", pr.HeadBranch, pr.MergeBase, err)
 		return ""
@@ -561,140 +829,281 @@ func GetSquashMergeCommitMessages(pr *models.PullRequest) string {
 
 	posterSig := pr.Issue.Poster.NewGitSig().String()
 
-	authorsMap := map[string]bool{}
-	authors := make([]string, 0, list.Len())
+	uniqueAuthors := make(container.Set[string])
+	authors := make([]string, 0, len(commits))
 	stringBuilder := strings.Builder{}
 
-	stringBuilder.WriteString(pr.Issue.Content)
-	if stringBuilder.Len() > 0 {
-		stringBuilder.WriteRune('\n')
-		stringBuilder.WriteRune('\n')
-	}
-
-	// commits list is in reverse chronological order
-	element := list.Back()
-	for element != nil {
-		commit := element.Value.(*git.Commit)
-		authorString := commit.Author.String()
-		if !authorsMap[authorString] && authorString != posterSig {
-			authors = append(authors, authorString)
-			authorsMap[authorString] = true
+	if !setting.Repository.PullRequest.PopulateSquashCommentWithCommitMessages {
+		// use PR's title and description as squash commit message
+		message := strings.TrimSpace(pr.Issue.Content)
+		stringBuilder.WriteString(message)
+		if stringBuilder.Len() > 0 {
+			stringBuilder.WriteRune('\n')
+			if !commitMessageTrailersPattern.MatchString(message) {
+				// TODO: this trailer check doesn't work with the separator line added below for the co-authors
+				stringBuilder.WriteRune('\n')
+			}
 		}
-		element = element.Prev()
+	} else {
+		// use PR's commit messages as squash commit message
+		// commits list is in reverse chronological order
+		maxMsgSize := setting.Repository.PullRequest.DefaultMergeMessageSize
+		for _, commit := range slices.Backward(commits) {
+			msg := strings.TrimSpace(commit.MessageUTF8())
+			if msg == "" {
+				continue
+			}
+
+			// This format follows GitHub's squash commit message style,
+			// even if there are other "* " in the commit message body, they are written as-is.
+			// Maybe, ideally, we should indent those lines too.
+			_, _ = fmt.Fprintf(&stringBuilder, "* %s\n\n", msg)
+			if maxMsgSize > 0 && stringBuilder.Len() >= maxMsgSize {
+				tmp := stringBuilder.String()
+				wasValidUtf8 := utf8.ValidString(tmp)
+				tmp = tmp[:maxMsgSize] + "..."
+				if wasValidUtf8 {
+					// If the message was valid UTF-8 before truncation, ensure it remains valid after truncation
+					// For non-utf8 messages, we can't do much about it, end users should use utf-8 as much as possible
+					tmp = strings.ToValidUTF8(tmp, "")
+				}
+				stringBuilder.Reset()
+				stringBuilder.WriteString(tmp)
+				break
+			}
+		}
 	}
 
-	// Consider collecting the remaining authors
+	// collect co-authors
+	for _, commit := range commits {
+		authorString := commit.Author.String()
+		if uniqueAuthors.Add(authorString) && authorString != posterSig {
+			// Compare use account as well to avoid adding the same author multiple times
+			// when email addresses are private or multiple emails are used.
+			commitUser, _ := user_model.GetUserByEmail(ctx, commit.Author.Email)
+			if commitUser == nil || commitUser.ID != pr.Issue.Poster.ID {
+				authors = append(authors, authorString)
+			}
+		}
+	}
+
+	// collect the remaining authors
 	if limit >= 0 && setting.Repository.PullRequest.DefaultMergeMessageAllAuthors {
 		skip := limit
 		limit = 30
 		for {
-			list, err := gitRepo.CommitsBetweenLimit(headCommit, mergeBase, limit, skip)
+			commits, err = gitRepo.CommitsBetweenLimit(headCommit, mergeBase, limit, skip)
 			if err != nil {
 				log.Error("Unable to get commits between: %s %s Error: %v", pr.HeadBranch, pr.MergeBase, err)
 				return ""
-
 			}
-			if list.Len() == 0 {
+			if len(commits) == 0 {
 				break
 			}
-			element := list.Front()
-			for element != nil {
-				commit := element.Value.(*git.Commit)
-
+			for _, commit := range commits {
 				authorString := commit.Author.String()
-				if !authorsMap[authorString] && authorString != posterSig {
-					authors = append(authors, authorString)
-					authorsMap[authorString] = true
+				if uniqueAuthors.Add(authorString) && authorString != posterSig {
+					commitUser, _ := user_model.GetUserByEmail(ctx, commit.Author.Email)
+					if commitUser == nil || commitUser.ID != pr.Issue.Poster.ID {
+						authors = append(authors, authorString)
+					}
 				}
-				element = element.Next()
 			}
 			skip += limit
 		}
 	}
 
-	if len(authors) > 0 {
-		if _, err := stringBuilder.WriteRune('\n'); err != nil {
-			log.Error("Unable to write to string builder Error: %v", err)
-			return ""
-		}
+	if stringBuilder.Len() > 0 && len(authors) > 0 {
+		// TODO: this separator line doesn't work with the trailer check (commitMessageTrailersPattern) above
+		stringBuilder.WriteString("---------\n\n")
 	}
 
 	for _, author := range authors {
-		if _, err := stringBuilder.Write([]byte("Co-authored-by: ")); err != nil {
-			log.Error("Unable to write to string builder Error: %v", err)
-			return ""
-		}
-		if _, err := stringBuilder.Write([]byte(author)); err != nil {
-			log.Error("Unable to write to string builder Error: %v", err)
-			return ""
-		}
-		if _, err := stringBuilder.WriteRune('\n'); err != nil {
-			log.Error("Unable to write to string builder Error: %v", err)
-			return ""
-		}
+		stringBuilder.WriteString(git.CoAuthoredByTrailer + ": ")
+		stringBuilder.WriteString(author)
+		stringBuilder.WriteRune('\n')
 	}
 
 	return stringBuilder.String()
 }
 
-// GetLastCommitStatus returns list of commit statuses for latest commit on this pull request.
-func GetLastCommitStatus(pr *models.PullRequest) (status []*models.CommitStatus, err error) {
-	if err = pr.LoadBaseRepo(); err != nil {
-		return nil, err
+// GetIssuesAllCommitStatus returns a map of issue ID to a list of all statuses for the most recent commit as well as a map of issue ID to only the commit's latest status
+func GetIssuesAllCommitStatus(ctx context.Context, issues issues_model.IssueList) (map[int64][]*git_model.CommitStatus, map[int64]*git_model.CommitStatus, error) {
+	if err := issues.LoadPullRequests(ctx); err != nil {
+		return nil, nil, err
+	}
+	if _, err := issues.LoadRepositories(ctx); err != nil {
+		return nil, nil, err
 	}
 
-	gitRepo, err := git.OpenRepository(pr.BaseRepo.RepoPath())
-	if err != nil {
-		return nil, err
-	}
-	defer gitRepo.Close()
+	var (
+		gitRepos = make(map[int64]*git.Repository)
+		res      = make(map[int64][]*git_model.CommitStatus)
+		lastRes  = make(map[int64]*git_model.CommitStatus)
+		err      error
+	)
+	defer func() {
+		for _, gitRepo := range gitRepos {
+			gitRepo.Close()
+		}
+	}()
 
-	compareInfo, err := gitRepo.GetCompareInfo(pr.BaseRepo.RepoPath(), pr.MergeBase, pr.GetGitRefName())
-	if err != nil {
-		return nil, err
+	for _, issue := range issues {
+		if !issue.IsPull {
+			continue
+		}
+		gitRepo, ok := gitRepos[issue.RepoID]
+		if !ok {
+			gitRepo, err = gitrepo.OpenRepository(ctx, issue.Repo)
+			if err != nil {
+				log.Error("Cannot open git repository %-v for issue #%d[%d]. Error: %v", issue.Repo, issue.Index, issue.ID, err)
+				continue
+			}
+			gitRepos[issue.RepoID] = gitRepo
+		}
+
+		statuses, lastStatus, err := getAllCommitStatus(ctx, gitRepo, issue.PullRequest)
+		if err != nil {
+			log.Error("getAllCommitStatus: cant get commit statuses of pull [%d]: %v", issue.PullRequest.ID, err)
+			continue
+		}
+		res[issue.PullRequest.ID] = statuses
+		lastRes[issue.PullRequest.ID] = lastStatus
+	}
+	return res, lastRes, nil
+}
+
+// getAllCommitStatus get pr's commit statuses.
+func getAllCommitStatus(ctx context.Context, gitRepo *git.Repository, pr *issues_model.PullRequest) (statuses []*git_model.CommitStatus, lastStatus *git_model.CommitStatus, err error) {
+	sha, shaErr := gitRepo.GetRefCommitID(pr.GetGitHeadRefName())
+	if shaErr != nil {
+		return nil, nil, shaErr
 	}
 
-	if compareInfo.Commits.Len() == 0 {
-		return nil, errors.New("pull request has no commits")
-	}
-
-	sha := compareInfo.Commits.Front().Value.(*git.Commit).ID.String()
-	statusList, err := models.GetLatestCommitStatus(pr.BaseRepo.ID, sha, models.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return statusList, nil
+	statuses, err = git_model.GetLatestCommitStatus(ctx, pr.BaseRepo.ID, sha, db.ListOptionsAll)
+	lastStatus = git_model.CalcCommitStatus(statuses)
+	return statuses, lastStatus, err
 }
 
 // IsHeadEqualWithBranch returns if the commits of branchName are available in pull request head
-func IsHeadEqualWithBranch(pr *models.PullRequest, branchName string) (bool, error) {
+func IsHeadEqualWithBranch(ctx context.Context, pr *issues_model.PullRequest, branchName string) (bool, error) {
 	var err error
-	if err = pr.LoadBaseRepo(); err != nil {
+	if err = pr.LoadBaseRepo(ctx); err != nil {
 		return false, err
 	}
-	baseGitRepo, err := git.OpenRepository(pr.BaseRepo.RepoPath())
+	baseGitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, pr.BaseRepo)
 	if err != nil {
 		return false, err
 	}
-	defer baseGitRepo.Close()
+	defer closer.Close()
 
 	baseCommit, err := baseGitRepo.GetBranchCommit(branchName)
 	if err != nil {
 		return false, err
 	}
 
-	if err = pr.LoadHeadRepo(); err != nil {
+	if err = pr.LoadHeadRepo(ctx); err != nil {
 		return false, err
 	}
-	headGitRepo, err := git.OpenRepository(pr.HeadRepo.RepoPath())
-	if err != nil {
-		return false, err
-	}
-	defer headGitRepo.Close()
+	var headGitRepo *git.Repository
+	if pr.HeadRepoID == pr.BaseRepoID {
+		headGitRepo = baseGitRepo
+	} else {
+		var closer io.Closer
 
-	headCommit, err := headGitRepo.GetBranchCommit(pr.HeadBranch)
-	if err != nil {
-		return false, err
+		headGitRepo, closer, err = gitrepo.RepositoryFromContextOrOpen(ctx, pr.HeadRepo)
+		if err != nil {
+			return false, err
+		}
+		defer closer.Close()
+	}
+
+	var headCommit *git.Commit
+	if pr.Flow == issues_model.PullRequestFlowGithub {
+		headCommit, err = headGitRepo.GetBranchCommit(pr.HeadBranch)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		pr.HeadCommitID, err = baseGitRepo.GetRefCommitID(pr.GetGitHeadRefName())
+		if err != nil {
+			return false, err
+		}
+		if headCommit, err = baseGitRepo.GetCommit(pr.HeadCommitID); err != nil {
+			return false, err
+		}
 	}
 	return baseCommit.HasPreviousCommit(headCommit.ID)
+}
+
+type CommitInfo struct {
+	Summary               string `json:"summary"`
+	CommitterOrAuthorName string `json:"committer_or_author_name"`
+	ID                    string `json:"id"`
+	ShortSha              string `json:"short_sha"`
+	Time                  string `json:"time"`
+}
+
+// GetPullCommits returns all commits on given pull request and the last review commit sha
+// Attention: The last review commit sha must be from the latest review whose commit id is not empty.
+// So the type of the latest review cannot be "ReviewTypeRequest".
+func GetPullCommits(ctx context.Context, baseGitRepo *git.Repository, doer *user_model.User, issue *issues_model.Issue) ([]CommitInfo, string, error) {
+	pull := issue.PullRequest
+
+	if err := pull.LoadBaseRepo(ctx); err != nil {
+		return nil, "", err
+	}
+	baseBranch := pull.BaseBranch
+	if pull.HasMerged {
+		baseBranch = pull.MergeBase
+	}
+	compareInfo, err := git_service.GetCompareInfo(ctx, pull.BaseRepo, pull.BaseRepo, baseGitRepo, git.RefNameFromBranch(baseBranch), git.RefName(pull.GetGitHeadRefName()), false, false)
+	if err != nil {
+		return nil, "", err
+	}
+
+	commits := make([]CommitInfo, 0, len(compareInfo.Commits))
+
+	for _, commit := range compareInfo.Commits {
+		var committerOrAuthorName string
+		var commitTime time.Time
+		if commit.Author != nil {
+			committerOrAuthorName = commit.Author.Name
+			commitTime = commit.Author.When
+		} else {
+			committerOrAuthorName = commit.Committer.Name
+			commitTime = commit.Committer.When
+		}
+
+		commits = append(commits, CommitInfo{
+			Summary:               commit.MessageTitle(),
+			CommitterOrAuthorName: committerOrAuthorName,
+			ID:                    commit.ID.String(),
+			ShortSha:              base.ShortSha(commit.ID.String()),
+			Time:                  commitTime.Format(time.RFC3339),
+		})
+	}
+
+	var lastReviewCommitID string
+	if doer != nil {
+		// get last review of current user and store information in context (if available)
+		lastreview, err := issues_model.FindLatestReviews(ctx, issues_model.FindReviewOptions{
+			IssueID:    issue.ID,
+			ReviewerID: doer.ID,
+			Types: []issues_model.ReviewType{
+				issues_model.ReviewTypeApprove,
+				issues_model.ReviewTypeComment,
+				issues_model.ReviewTypeReject,
+			},
+		})
+
+		if err != nil && !issues_model.IsErrReviewNotExist(err) {
+			return nil, "", err
+		}
+		if len(lastreview) > 0 {
+			lastReviewCommitID = lastreview[0].CommitID
+		}
+	}
+
+	return commits, lastReviewCommitID, nil
 }

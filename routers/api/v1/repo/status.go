@@ -1,6 +1,5 @@
 // Copyright 2017 Gitea. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package repo
 
@@ -8,16 +7,18 @@ import (
 	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
-	"code.gitea.io/gitea/modules/repofiles"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	commitstatus_service "gitea.dev/services/repository/commitstatus"
 )
 
 // NewCommitStatus creates a new CommitStatus
-func NewCommitStatus(ctx *context.APIContext, form api.CreateStatusOption) {
+func NewCommitStatus(ctx *context.APIContext) {
 	// swagger:operation POST /repos/{owner}/{repo}/statuses/{sha} repository repoCreateStatus
 	// ---
 	// summary: Create a commit status
@@ -48,24 +49,27 @@ func NewCommitStatus(ctx *context.APIContext, form api.CreateStatusOption) {
 	//     "$ref": "#/responses/CommitStatus"
 	//   "400":
 	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	sha := ctx.Params("sha")
+	form := web.GetForm(ctx).(*api.CreateStatusOption)
+	sha := ctx.PathParam("sha")
 	if len(sha) == 0 {
-		ctx.Error(http.StatusBadRequest, "sha not given", nil)
+		ctx.APIError(http.StatusBadRequest, "sha not provided")
 		return
 	}
-	status := &models.CommitStatus{
-		State:       api.CommitStatusState(form.State),
+	status := &git_model.CommitStatus{
+		State:       form.State,
 		TargetURL:   form.TargetURL,
 		Description: form.Description,
 		Context:     form.Context,
 	}
-	if err := repofiles.CreateCommitStatus(ctx.Repo.Repository, ctx.User, sha, status); err != nil {
-		ctx.Error(http.StatusInternalServerError, "CreateCommitStatus", err)
+	if err := commitstatus_service.CreateCommitStatus(ctx, ctx.Repo.Repository, ctx.Doer, sha, status); err != nil {
+		ctx.APIErrorInternal(err)
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, convert.ToCommitStatus(status))
+	ctx.JSON(http.StatusCreated, convert.ToCommitStatus(ctx, status))
 }
 
 // GetCommitStatuses returns all statuses for any given commit hash
@@ -116,8 +120,10 @@ func GetCommitStatuses(ctx *context.APIContext) {
 	//     "$ref": "#/responses/CommitStatusList"
 	//   "400":
 	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	getCommitStatuses(ctx, ctx.Params("sha"))
+	getCommitStatuses(ctx, ctx.PathParam("sha"))
 }
 
 // GetCommitStatusesByRef returns all statuses for any given commit ref
@@ -168,67 +174,40 @@ func GetCommitStatusesByRef(ctx *context.APIContext) {
 	//     "$ref": "#/responses/CommitStatusList"
 	//   "400":
 	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	filter := ctx.Params("ref")
-	if len(filter) == 0 {
-		ctx.Error(http.StatusBadRequest, "ref not given", nil)
+	refCommit := resolveRefCommit(ctx, ctx.PathParam("ref"), 7)
+	if ctx.Written() {
 		return
 	}
-
-	for _, reftype := range []string{"heads", "tags"} { //Search branches and tags
-		refSHA, lastMethodName, err := searchRefCommitByType(ctx, reftype, filter)
-		if err != nil {
-			ctx.Error(http.StatusInternalServerError, lastMethodName, err)
-			return
-		}
-		if refSHA != "" {
-			filter = refSHA
-			break
-		}
-
-	}
-
-	getCommitStatuses(ctx, filter) //By default filter is maybe the raw SHA
+	getCommitStatuses(ctx, refCommit.CommitID)
 }
 
-func searchRefCommitByType(ctx *context.APIContext, refType, filter string) (string, string, error) {
-	refs, lastMethodName, err := getGitRefs(ctx, refType+"/"+filter) //Search by type
-	if err != nil {
-		return "", lastMethodName, err
-	}
-	if len(refs) > 0 {
-		return refs[0].Object.String(), "", nil //Return found SHA
-	}
-	return "", "", nil
-}
-
-func getCommitStatuses(ctx *context.APIContext, sha string) {
-	if len(sha) == 0 {
-		ctx.Error(http.StatusBadRequest, "ref/sha not given", nil)
-		return
-	}
+func getCommitStatuses(ctx *context.APIContext, commitID string) {
 	repo := ctx.Repo.Repository
 
 	listOptions := utils.GetListOptions(ctx)
 
-	statuses, maxResults, err := models.GetCommitStatuses(repo, sha, &models.CommitStatusOptions{
+	statuses, maxResults, err := db.FindAndCount[git_model.CommitStatus](ctx, &git_model.CommitStatusOptions{
 		ListOptions: listOptions,
-		SortType:    ctx.QueryTrim("sort"),
-		State:       ctx.QueryTrim("state"),
+		RepoID:      repo.ID,
+		SHA:         commitID,
+		SortType:    ctx.FormTrim("sort"),
+		State:       ctx.FormTrim("state"),
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetCommitStatuses", fmt.Errorf("GetCommitStatuses[%s, %s, %d]: %v", repo.FullName(), sha, ctx.QueryInt("page"), err))
+		ctx.APIErrorInternal(fmt.Errorf("GetCommitStatuses[%s, %s, %d]: %w", repo.FullName(), commitID, ctx.FormInt("page"), err))
 		return
 	}
 
 	apiStatuses := make([]*api.CommitStatus, 0, len(statuses))
 	for _, status := range statuses {
-		apiStatuses = append(apiStatuses, convert.ToCommitStatus(status))
+		apiStatuses = append(apiStatuses, convert.ToCommitStatus(ctx, status))
 	}
 
-	ctx.SetLinkHeader(int(maxResults), listOptions.PageSize)
-	ctx.Header().Set("X-Total-Count", fmt.Sprintf("%d", maxResults))
-	ctx.Header().Set("Access-Control-Expose-Headers", "X-Total-Count, Link")
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
+	ctx.SetTotalCountHeader(maxResults)
 
 	ctx.JSON(http.StatusOK, apiStatuses)
 }
@@ -269,26 +248,31 @@ func GetCombinedCommitStatusByRef(ctx *context.APIContext) {
 	//     "$ref": "#/responses/CombinedStatus"
 	//   "400":
 	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	sha := ctx.Params("ref")
-	if len(sha) == 0 {
-		ctx.Error(http.StatusBadRequest, "ref/sha not given", nil)
+	refCommit := resolveRefCommit(ctx, ctx.PathParam("ref"), 7)
+	if ctx.Written() {
 		return
 	}
+
 	repo := ctx.Repo.Repository
-
-	statuses, err := models.GetLatestCommitStatus(repo.ID, sha, utils.GetListOptions(ctx))
+	listOptions := utils.GetListOptions(ctx)
+	statuses, err := git_model.GetLatestCommitStatus(ctx, repo.ID, refCommit.Commit.ID.String(), listOptions)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetLatestCommitStatus", fmt.Errorf("GetLatestCommitStatus[%s, %s]: %v", repo.FullName(), sha, err))
+		ctx.APIErrorInternal(fmt.Errorf("GetLatestCommitStatus[%s, %s]: %w", repo.FullName(), refCommit.CommitID, err))
 		return
 	}
 
-	if len(statuses) == 0 {
-		ctx.JSON(http.StatusOK, &api.CombinedStatus{})
+	count, err := git_model.CountLatestCommitStatus(ctx, repo.ID, refCommit.Commit.ID.String())
+	if err != nil {
+		ctx.APIErrorInternal(fmt.Errorf("CountLatestCommitStatus[%s, %s]: %w", repo.FullName(), refCommit.CommitID, err))
 		return
 	}
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
 
-	combiStatus := convert.ToCombinedStatus(statuses, convert.ToRepo(repo, ctx.Repo.AccessMode))
-
+	combiStatus := convert.ToCombinedStatus(ctx, refCommit.Commit.ID.String(), statuses,
+		convert.ToRepo(ctx, repo, ctx.Repo.Permission))
 	ctx.JSON(http.StatusOK, combiStatus)
 }

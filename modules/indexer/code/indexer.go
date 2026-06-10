@@ -1,160 +1,137 @@
 // Copyright 2016 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package code
 
 import (
 	"context"
 	"os"
-	"strconv"
-	"strings"
+	"runtime/pprof"
+	"slices"
+	"sync/atomic"
 	"time"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/queue"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/indexer"
+	"gitea.dev/modules/indexer/code/bleve"
+	"gitea.dev/modules/indexer/code/elasticsearch"
+	"gitea.dev/modules/indexer/code/internal"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/queue"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
-
-// SearchResult result of performing a search in a repo
-type SearchResult struct {
-	RepoID      int64
-	StartIndex  int
-	EndIndex    int
-	Filename    string
-	Content     string
-	CommitID    string
-	UpdatedUnix timeutil.TimeStamp
-	Language    string
-	Color       string
-}
-
-// SearchResultLanguages result of top languages count in search results
-type SearchResultLanguages struct {
-	Language string
-	Color    string
-	Count    int
-}
-
-// Indexer defines an interface to index and search code contents
-type Indexer interface {
-	Index(repo *models.Repository, sha string, changes *repoChanges) error
-	Delete(repoID int64) error
-	Search(repoIDs []int64, language, keyword string, page, pageSize int) (int64, []*SearchResult, []*SearchResultLanguages, error)
-	Close()
-}
-
-func filenameIndexerID(repoID int64, filename string) string {
-	return indexerID(repoID) + "_" + filename
-}
-
-func indexerID(id int64) string {
-	return strconv.FormatInt(id, 36)
-}
-
-func parseIndexerID(indexerID string) (int64, string) {
-	index := strings.IndexByte(indexerID, '_')
-	if index == -1 {
-		log.Error("Unexpected ID in repo indexer: %s", indexerID)
-	}
-	repoID, _ := strconv.ParseInt(indexerID[:index], 36, 64)
-	return repoID, indexerID[index+1:]
-}
-
-func filenameOfIndexerID(indexerID string) string {
-	index := strings.IndexByte(indexerID, '_')
-	if index == -1 {
-		log.Error("Unexpected ID in repo indexer: %s", indexerID)
-	}
-	return indexerID[index+1:]
-}
-
-// IndexerData represents data stored in the code indexer
-type IndexerData struct {
-	RepoID   int64
-	IsDelete bool
-}
 
 var (
-	indexerQueue queue.Queue
+	indexerQueue *queue.WorkerPoolQueue[*internal.IndexerData]
+	// globalIndexer is the global indexer, it cannot be nil.
+	// When the real indexer is not ready, it will be a dummy indexer which will return error to explain it's not ready.
+	// So it's always safe use it as *globalIndexer.Load() and call its methods.
+	globalIndexer atomic.Pointer[internal.Indexer]
 )
 
-func index(indexer Indexer, repoID int64) error {
-	repo, err := models.GetRepositoryByID(repoID)
+func init() {
+	dummyIndexer := internal.NewDummyIndexer()
+	globalIndexer.Store(&dummyIndexer)
+}
+
+func index(ctx context.Context, indexer internal.Indexer, repoID int64) error {
+	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
+	if repo_model.IsErrRepoNotExist(err) {
+		return indexer.Delete(ctx, repoID)
+	}
 	if err != nil {
 		return err
 	}
 
-	sha, err := getDefaultBranchSha(repo)
+	repoTypes := setting.Indexer.RepoIndexerRepoTypes
+
+	if len(repoTypes) == 0 {
+		repoTypes = []string{"sources"}
+	}
+
+	// skip forks from being indexed if unit is not present
+	if !slices.Contains(repoTypes, "forks") && repo.IsFork {
+		return nil
+	}
+
+	// skip mirrors from being indexed if unit is not present
+	if !slices.Contains(repoTypes, "mirrors") && repo.IsMirror {
+		return nil
+	}
+
+	// skip templates from being indexed if unit is not present
+	if !slices.Contains(repoTypes, "templates") && repo.IsTemplate {
+		return nil
+	}
+
+	// skip regular repos from being indexed if unit is not present
+	if !slices.Contains(repoTypes, "sources") && !repo.IsFork && !repo.IsMirror && !repo.IsTemplate {
+		return nil
+	}
+
+	sha, err := getDefaultBranchSha(ctx, repo)
 	if err != nil {
 		return err
 	}
-	changes, err := getRepoChanges(repo, sha)
+	changes, err := getRepoChanges(ctx, repo, sha)
 	if err != nil {
 		return err
 	} else if changes == nil {
 		return nil
 	}
 
-	if err := indexer.Index(repo, sha, changes); err != nil {
+	if err := indexer.Index(ctx, repo, sha, changes); err != nil {
 		return err
 	}
 
-	return repo.UpdateIndexerStatus(models.RepoIndexerTypeCode, sha)
+	return repo_model.UpdateIndexerStatus(ctx, repo, repo_model.RepoIndexerTypeCode, sha)
 }
 
 // Init initialize the repo indexer
 func Init() {
 	if !setting.Indexer.RepoIndexerEnabled {
-		indexer.Close()
+		(*globalIndexer.Load()).Close()
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel, finished := process.GetManager().AddTypedContext(context.Background(), "Service: CodeIndexer", process.SystemProcessType, false)
 
-	graceful.GetManager().RunAtTerminate(ctx, func() {
+	graceful.GetManager().RunAtTerminate(func() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		cancel()
 		log.Debug("Closing repository indexer")
-		indexer.Close()
+		(*globalIndexer.Load()).Close()
 		log.Info("PID: %d Repository Indexer closed", os.Getpid())
+		finished()
 	})
 
-	waitChannel := make(chan time.Duration)
+	waitChannel := make(chan time.Duration, 1)
 
 	// Create the Queue
 	switch setting.Indexer.RepoType {
 	case "bleve", "elasticsearch":
-		handler := func(data ...queue.Data) {
-			idx, err := indexer.get()
-			if idx == nil || err != nil {
-				log.Error("Codes indexer handler: unable to get indexer!")
-				return
-			}
-
-			for _, datum := range data {
-				indexerData, ok := datum.(*IndexerData)
-				if !ok {
-					log.Error("Unable to process provided datum: %v - not possible to cast to IndexerData", datum)
-					continue
-				}
-				log.Trace("IndexerData Process: %v %t", indexerData.RepoID, indexerData.IsDelete)
-
-				if indexerData.IsDelete {
-					if err := indexer.Delete(indexerData.RepoID); err != nil {
-						log.Error("indexer.Delete: %v", err)
-					}
-				} else {
-					if err := index(indexer, indexerData.RepoID); err != nil {
-						log.Error("index: %v", err)
-						continue
+		handler := func(items ...*internal.IndexerData) (unhandled []*internal.IndexerData) {
+			indexer := *globalIndexer.Load()
+			for _, indexerData := range items {
+				log.Trace("IndexerData Process Repo: %d", indexerData.RepoID)
+				if err := index(ctx, indexer, indexerData.RepoID); err != nil {
+					if !setting.IsInTesting {
+						log.Error("Codes indexer handler: index error for repo %v: %v", indexerData.RepoID, err)
 					}
 				}
 			}
+			return nil // do not re-queue the failed items, otherwise some broken repo will block the queue
 		}
 
-		indexerQueue = queue.CreateQueue("code_indexer", handler, &IndexerData{})
+		indexerQueue = queue.CreateUniqueQueue(ctx, "code_indexer", handler)
 		if indexerQueue == nil {
 			log.Fatal("Unable to create codes indexer queue")
 		}
@@ -163,10 +140,11 @@ func Init() {
 	}
 
 	go func() {
+		pprof.SetGoroutineLabels(ctx)
 		start := time.Now()
 		var (
-			rIndexer Indexer
-			populate bool
+			rIndexer internal.Indexer
+			existed  bool
 			err      error
 		)
 		switch setting.Indexer.RepoType {
@@ -180,46 +158,43 @@ func Init() {
 				}
 			}()
 
-			rIndexer, populate, err = NewBleveIndexer(setting.Indexer.RepoPath)
+			rIndexer = bleve.NewIndexer(setting.Indexer.RepoPath)
+			existed, err = rIndexer.Init(ctx)
 			if err != nil {
-				if rIndexer != nil {
-					rIndexer.Close()
-				}
 				cancel()
-				indexer.Close()
+				(*globalIndexer.Load()).Close()
 				close(waitChannel)
 				log.Fatal("PID: %d Unable to initialize the bleve Repository Indexer at path: %s Error: %v", os.Getpid(), setting.Indexer.RepoPath, err)
 			}
 		case "elasticsearch":
-			log.Info("PID: %d Initializing Repository Indexer at: %s", os.Getpid(), setting.Indexer.RepoConnStr)
+			log.Info("PID: %d Initializing Repository Indexer at: %s", os.Getpid(), util.SanitizeCredentialURLs(setting.Indexer.RepoConnStr))
 			defer func() {
 				if err := recover(); err != nil {
 					log.Error("PANIC whilst initializing repository indexer: %v\nStacktrace: %s", err, log.Stack(2))
 					log.Error("The indexer files are likely corrupted and may need to be deleted")
-					log.Error("You can completely remove the \"%s\" index to make Gitea recreate the indexes", setting.Indexer.RepoConnStr)
+					log.Error("You can completely remove the \"%s\" index to make Gitea recreate the indexes", util.SanitizeCredentialURLs(setting.Indexer.RepoConnStr))
 				}
 			}()
 
-			rIndexer, populate, err = NewElasticSearchIndexer(setting.Indexer.RepoConnStr, setting.Indexer.RepoIndexerName)
+			rIndexer = elasticsearch.NewIndexer(setting.Indexer.RepoConnStr, setting.Indexer.RepoIndexerName)
+			existed, err = rIndexer.Init(ctx)
 			if err != nil {
-				if rIndexer != nil {
-					rIndexer.Close()
-				}
 				cancel()
-				indexer.Close()
+				(*globalIndexer.Load()).Close()
 				close(waitChannel)
-				log.Fatal("PID: %d Unable to initialize the elasticsearch Repository Indexer connstr: %s Error: %v", os.Getpid(), setting.Indexer.RepoConnStr, err)
+				log.Fatal("PID: %d Unable to initialize the elasticsearch Repository Indexer connstr: %s Error: %v", os.Getpid(), util.SanitizeCredentialURLs(setting.Indexer.RepoConnStr), err)
 			}
+
 		default:
 			log.Fatal("PID: %d Unknown Indexer type: %s", os.Getpid(), setting.Indexer.RepoType)
 		}
 
-		indexer.set(rIndexer)
+		globalIndexer.Store(&rIndexer)
 
 		// Start processing the queue
-		go graceful.GetManager().RunWithShutdownFns(indexerQueue.Run)
+		go graceful.GetManager().RunWithCancel(indexerQueue)
 
-		if populate {
+		if !existed { // populate the index because it's created for the first time
 			go graceful.GetManager().RunWithShutdownContext(populateRepoIndexer)
 		}
 		select {
@@ -232,6 +207,7 @@ func Init() {
 
 	if setting.Indexer.StartupTimeout > 0 {
 		go func() {
+			pprof.SetGoroutineLabels(ctx)
 			timeout := setting.Indexer.StartupTimeout
 			if graceful.GetManager().IsChild() && setting.GracefulHammerTime > 0 {
 				timeout += setting.GracefulHammerTime
@@ -240,38 +216,35 @@ func Init() {
 			case <-graceful.GetManager().IsShutdown():
 				log.Warn("Shutdown before Repository Indexer completed initialization")
 				cancel()
-				indexer.Close()
+				(*globalIndexer.Load()).Close()
 			case duration, ok := <-waitChannel:
 				if !ok {
 					log.Warn("Repository Indexer Initialization failed")
 					cancel()
-					indexer.Close()
+					(*globalIndexer.Load()).Close()
 					return
 				}
 				log.Info("Repository Indexer Initialization took %v", duration)
 			case <-time.After(timeout):
 				cancel()
-				indexer.Close()
+				(*globalIndexer.Load()).Close()
 				log.Fatal("Repository Indexer Initialization Timed-Out after: %v", timeout)
 			}
 		}()
 	}
 }
 
-// DeleteRepoFromIndexer remove all of a repository's entries from the indexer
-func DeleteRepoFromIndexer(repo *models.Repository) {
-	indexData := &IndexerData{RepoID: repo.ID, IsDelete: true}
-	if err := indexerQueue.Push(indexData); err != nil {
-		log.Error("Delete repo index data %v failed: %v", indexData, err)
-	}
-}
-
 // UpdateRepoIndexer update a repository's entries in the indexer
-func UpdateRepoIndexer(repo *models.Repository) {
-	indexData := &IndexerData{RepoID: repo.ID}
+func UpdateRepoIndexer(repo *repo_model.Repository) {
+	indexData := &internal.IndexerData{RepoID: repo.ID}
 	if err := indexerQueue.Push(indexData); err != nil {
 		log.Error("Update repo index data %v failed: %v", indexData, err)
 	}
+}
+
+// IsAvailable checks if issue indexer is available
+func IsAvailable(ctx context.Context) bool {
+	return (*globalIndexer.Load()).Ping(ctx) == nil
 }
 
 // populateRepoIndexer populate the repo indexer with pre-existing data. This
@@ -279,7 +252,7 @@ func UpdateRepoIndexer(repo *models.Repository) {
 func populateRepoIndexer(ctx context.Context) {
 	log.Info("Populating the repo indexer with existing repositories")
 
-	exist, err := models.IsTableNotEmpty("repository")
+	exist, err := db.IsTableNotEmpty("repository")
 	if err != nil {
 		log.Fatal("System error: %v", err)
 	} else if !exist {
@@ -289,12 +262,12 @@ func populateRepoIndexer(ctx context.Context) {
 	// if there is any existing repo indexer metadata in the DB, delete it
 	// since we are starting afresh. Also, xorm requires deletes to have a
 	// condition, and we want to delete everything, thus 1=1.
-	if err := models.DeleteAllRecords("repo_indexer_status"); err != nil {
+	if err := db.DeleteAllRecords("repo_indexer_status"); err != nil {
 		log.Fatal("System error: %v", err)
 	}
 
 	var maxRepoID int64
-	if maxRepoID, err = models.GetMaxID("repository"); err != nil {
+	if maxRepoID, err = db.GetMaxID("repository"); err != nil {
 		log.Fatal("System error: %v", err)
 	}
 
@@ -308,7 +281,7 @@ func populateRepoIndexer(ctx context.Context) {
 			return
 		default:
 		}
-		ids, err := models.GetUnindexedRepos(models.RepoIndexerTypeCode, maxRepoID, 0, 50)
+		ids, err := repo_model.GetUnindexedRepos(ctx, repo_model.RepoIndexerTypeCode, maxRepoID, 0, 50)
 		if err != nil {
 			log.Error("populateRepoIndexer: %v", err)
 			return
@@ -322,7 +295,7 @@ func populateRepoIndexer(ctx context.Context) {
 				return
 			default:
 			}
-			if err := indexerQueue.Push(&IndexerData{RepoID: id}); err != nil {
+			if err := indexerQueue.Push(&internal.IndexerData{RepoID: id}); err != nil {
 				log.Error("indexerQueue.Push: %v", err)
 				return
 			}
@@ -330,4 +303,12 @@ func populateRepoIndexer(ctx context.Context) {
 		}
 	}
 	log.Info("Done (re)populating the repo indexer with existing repositories")
+}
+
+func SupportedSearchModes() []indexer.SearchMode {
+	gi := globalIndexer.Load()
+	if gi == nil {
+		return nil
+	}
+	return (*gi).SupportedSearchModes()
 }

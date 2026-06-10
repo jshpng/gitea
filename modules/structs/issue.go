@@ -1,30 +1,39 @@
 // Copyright 2016 The Gogs Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package structs
 
 import (
+	"fmt"
+	"path"
+	"slices"
 	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v4"
 )
 
 // StateType issue state type
+//
+// swagger:enum StateType
 type StateType string
 
 const (
-	// StateOpen pr is opend
+	// StateOpen pr is opened
 	StateOpen StateType = "open"
 	// StateClosed pr is closed
 	StateClosed StateType = "closed"
-	// StateAll is all
-	StateAll StateType = "all"
 )
+
+// StateAll is a query parameter filter value, not a valid object state.
+const StateAll = "all"
 
 // PullRequestMeta PR info if an issue is a PR
 type PullRequestMeta struct {
-	HasMerged bool       `json:"merged"`
-	Merged    *time.Time `json:"merged_at"`
+	HasMerged        bool       `json:"merged"`
+	Merged           *time.Time `json:"merged_at"`
+	IsWorkInProgress bool       `json:"draft"`
+	HTMLURL          string     `json:"html_url"`
 }
 
 // RepositoryMeta basic repository information
@@ -38,28 +47,26 @@ type RepositoryMeta struct {
 // Issue represents an issue in a repository
 // swagger:model
 type Issue struct {
-	ID               int64      `json:"id"`
-	URL              string     `json:"url"`
-	HTMLURL          string     `json:"html_url"`
-	Index            int64      `json:"number"`
-	Poster           *User      `json:"user"`
-	OriginalAuthor   string     `json:"original_author"`
-	OriginalAuthorID int64      `json:"original_author_id"`
-	Title            string     `json:"title"`
-	Body             string     `json:"body"`
-	Ref              string     `json:"ref"`
-	Labels           []*Label   `json:"labels"`
-	Milestone        *Milestone `json:"milestone"`
+	ID               int64         `json:"id"`
+	URL              string        `json:"url"`
+	HTMLURL          string        `json:"html_url"`
+	Index            int64         `json:"number"`
+	Poster           *User         `json:"user"`
+	OriginalAuthor   string        `json:"original_author"`
+	OriginalAuthorID int64         `json:"original_author_id"`
+	Title            string        `json:"title"`
+	Body             string        `json:"body"`
+	Ref              string        `json:"ref"`
+	Attachments      []*Attachment `json:"assets"`
+	Labels           []*Label      `json:"labels"`
+	Milestone        *Milestone    `json:"milestone"`
+	Projects         []*Project    `json:"projects"`
 	// deprecated
-	Assignee  *User   `json:"assignee"`
-	Assignees []*User `json:"assignees"`
-	// Whether the issue is open or closed
-	//
-	// type: string
-	// enum: open,closed
-	State    StateType `json:"state"`
-	IsLocked bool      `json:"is_locked"`
-	Comments int       `json:"comments"`
+	Assignee  *User     `json:"assignee"`
+	Assignees []*User   `json:"assignees"`
+	State     StateType `json:"state"`
+	IsLocked  bool      `json:"is_locked"`
+	Comments  int       `json:"comments"`
 	// swagger:strfmt date-time
 	Created time.Time `json:"created_at"`
 	// swagger:strfmt date-time
@@ -69,14 +76,14 @@ type Issue struct {
 	// swagger:strfmt date-time
 	Deadline *time.Time `json:"due_date"`
 
+	TimeEstimate int64 `json:"time_estimate"`
+
 	PullRequest *PullRequestMeta `json:"pull_request"`
 	Repo        *RepositoryMeta  `json:"repository"`
-}
 
-// ListIssueOption list issue options
-type ListIssueOption struct {
-	Page  int
-	State string
+	PinOrder int `json:"pin_order"`
+	// The version of the issue content for optimistic locking
+	ContentVersion int `json:"content_version"`
 }
 
 // CreateIssueOption options to create one issue
@@ -94,7 +101,9 @@ type CreateIssueOption struct {
 	Milestone int64 `json:"milestone"`
 	// list of label ids
 	Labels []int64 `json:"labels"`
-	Closed bool    `json:"closed"`
+	// list of project ids
+	Projects []int64 `json:"projects"`
+	Closed   bool    `json:"closed"`
 }
 
 // EditIssueOption options for editing an issue
@@ -106,10 +115,19 @@ type EditIssueOption struct {
 	Assignee  *string  `json:"assignee"`
 	Assignees []string `json:"assignees"`
 	Milestone *int64   `json:"milestone"`
-	State     *string  `json:"state"`
+	// list of project ids to set (replaces existing projects)
+	Projects *[]int64 `json:"projects"`
+	State    *string  `json:"state"`
 	// swagger:strfmt date-time
 	Deadline       *time.Time `json:"due_date"`
 	RemoveDeadline *bool      `json:"unset_due_date"`
+	// The current version of the issue content to detect conflicts during editing
+	ContentVersion *int `json:"content_version"`
+}
+
+// IssueAssigneesOption options for adding/removing issue assignees
+type IssueAssigneesOption struct {
+	Assignees []string `json:"assignees"`
 }
 
 // EditDeadlineOption options for creating a deadline
@@ -126,18 +144,149 @@ type IssueDeadline struct {
 	Deadline *time.Time `json:"due_date"`
 }
 
+// IssueFormFieldType defines issue form field type, can be "markdown", "textarea", "input", "dropdown" or "checkboxes"
+//
+// swagger:enum IssueFormFieldType
+type IssueFormFieldType string
+
+const (
+	IssueFormFieldTypeMarkdown   IssueFormFieldType = "markdown"
+	IssueFormFieldTypeTextarea   IssueFormFieldType = "textarea"
+	IssueFormFieldTypeInput      IssueFormFieldType = "input"
+	IssueFormFieldTypeDropdown   IssueFormFieldType = "dropdown"
+	IssueFormFieldTypeCheckboxes IssueFormFieldType = "checkboxes"
+)
+
+// IssueFormField represents a form field
+// swagger:model
+type IssueFormField struct {
+	Type        IssueFormFieldType      `json:"type" yaml:"type"`
+	ID          string                  `json:"id" yaml:"id"`
+	Attributes  map[string]any          `json:"attributes" yaml:"attributes"`
+	Validations map[string]any          `json:"validations" yaml:"validations"`
+	Visible     []IssueFormFieldVisible `json:"visible,omitempty"`
+}
+
+func (iff IssueFormField) VisibleOnForm() bool {
+	if len(iff.Visible) == 0 {
+		return true
+	}
+	return slices.Contains(iff.Visible, IssueFormFieldVisibleForm)
+}
+
+func (iff IssueFormField) VisibleInContent() bool {
+	if len(iff.Visible) == 0 {
+		// we have our markdown exception
+		return iff.Type != IssueFormFieldTypeMarkdown
+	}
+	return slices.Contains(iff.Visible, IssueFormFieldVisibleContent)
+}
+
+// IssueFormFieldVisible defines issue form field visible
+//
+// swagger:enum IssueFormFieldVisible
+type IssueFormFieldVisible string
+
+const (
+	IssueFormFieldVisibleForm    IssueFormFieldVisible = "form"
+	IssueFormFieldVisibleContent IssueFormFieldVisible = "content"
+)
+
 // IssueTemplate represents an issue template for a repository
 // swagger:model
 type IssueTemplate struct {
-	Name     string   `json:"name" yaml:"name"`
-	Title    string   `json:"title" yaml:"title"`
-	About    string   `json:"about" yaml:"about"`
-	Labels   []string `json:"labels" yaml:"labels"`
-	Content  string   `json:"content" yaml:"-"`
-	FileName string   `json:"file_name" yaml:"-"`
+	Name      string                   `json:"name" yaml:"name"`
+	Title     string                   `json:"title" yaml:"title"`
+	About     string                   `json:"about" yaml:"about"` // Using "description" in a template file is compatible
+	Labels    IssueTemplateStringSlice `json:"labels" yaml:"labels"`
+	Assignees IssueTemplateStringSlice `json:"assignees" yaml:"assignees"`
+	Ref       string                   `json:"ref" yaml:"ref"`
+	Content   string                   `json:"content" yaml:"-"`
+	Fields    []*IssueFormField        `json:"body" yaml:"body"`
+	FileName  string                   `json:"file_name" yaml:"-"`
 }
 
-// Valid checks whether an IssueTemplate is considered valid, e.g. at least name and about
-func (it IssueTemplate) Valid() bool {
-	return strings.TrimSpace(it.Name) != "" && strings.TrimSpace(it.About) != ""
+type IssueTemplateStringSlice []string
+
+func (l *IssueTemplateStringSlice) UnmarshalYAML(value *yaml.Node) error {
+	var labels []string
+	if value.IsZero() {
+		*l = labels
+		return nil
+	}
+	switch value.Kind {
+	case yaml.ScalarNode:
+		str := ""
+		err := value.Decode(&str)
+		if err != nil {
+			return err
+		}
+		for v := range strings.SplitSeq(str, ",") {
+			if v = strings.TrimSpace(v); v == "" {
+				continue
+			}
+			labels = append(labels, v)
+		}
+		*l = labels
+		return nil
+	case yaml.SequenceNode:
+		if err := value.Decode(&labels); err != nil {
+			return err
+		}
+		*l = labels
+		return nil
+	}
+	return fmt.Errorf("cannot unmarshal %s into IssueTemplateStringSlice", value.ShortTag())
+}
+
+type IssueConfigContactLink struct {
+	Name  string `json:"name" yaml:"name"`
+	URL   string `json:"url" yaml:"url"`
+	About string `json:"about" yaml:"about"`
+}
+
+type IssueConfig struct {
+	BlankIssuesEnabled bool                     `json:"blank_issues_enabled" yaml:"blank_issues_enabled"`
+	ContactLinks       []IssueConfigContactLink `json:"contact_links" yaml:"contact_links"`
+}
+
+type IssueConfigValidation struct {
+	Valid   bool   `json:"valid"`
+	Message string `json:"message"`
+}
+
+// IssueTemplateType defines issue template type
+type IssueTemplateType string
+
+const (
+	IssueTemplateTypeMarkdown IssueTemplateType = "md"
+	IssueTemplateTypeYaml     IssueTemplateType = "yaml"
+)
+
+// Type returns the type of IssueTemplate, can be "md", "yaml" or empty for known
+func (it IssueTemplate) Type() IssueTemplateType {
+	if base := path.Base(it.FileName); base == "config.yaml" || base == "config.yml" {
+		// ignore config.yaml which is a special configuration file
+		return ""
+	}
+	if ext := path.Ext(it.FileName); ext == ".md" {
+		return IssueTemplateTypeMarkdown
+	} else if ext == ".yaml" || ext == ".yml" {
+		return IssueTemplateTypeYaml
+	}
+	return ""
+}
+
+// IssueMeta basic issue information
+// swagger:model
+type IssueMeta struct {
+	Index int64 `json:"index"`
+	// owner of the issue's repo
+	Owner string `json:"owner"`
+	Name  string `json:"repo"`
+}
+
+// LockIssueOption options to lock an issue
+type LockIssueOption struct {
+	Reason string `json:"lock_reason"`
 }

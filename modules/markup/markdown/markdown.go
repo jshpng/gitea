@@ -1,181 +1,303 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
 // Copyright 2018 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package markdown
 
 import (
 	"bytes"
+	"errors"
+	"html/template"
+	"io"
 	"strings"
-	"sync"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/markup/common"
-	"code.gitea.io/gitea/modules/setting"
-	giteautil "code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/markup/common"
+	"gitea.dev/modules/markup/markdown/math"
+	"gitea.dev/modules/setting"
+	giteautil "gitea.dev/modules/util"
 
-	chromahtml "github.com/alecthomas/chroma/formatters/html"
+	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark-highlighting"
-	meta "github.com/yuin/goldmark-meta"
+	highlighting "github.com/yuin/goldmark-highlighting/v2"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer"
 	"github.com/yuin/goldmark/renderer/html"
+	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 )
 
-var converter goldmark.Markdown
-var once = sync.Once{}
+var (
+	renderContextKey = parser.NewContextKey()
+	renderConfigKey  = parser.NewContextKey()
+)
 
-var urlPrefixKey = parser.NewContextKey()
-var isWikiKey = parser.NewContextKey()
-var renderMetasKey = parser.NewContextKey()
+type limitWriter struct {
+	w     io.Writer
+	sum   int64
+	limit int64
+}
 
-// NewGiteaParseContext creates a parser.Context with the gitea context set
-func NewGiteaParseContext(urlPrefix string, metas map[string]string, isWiki bool) parser.Context {
-	pc := parser.NewContext(parser.WithIDs(newPrefixedIDs()))
-	pc.Set(urlPrefixKey, urlPrefix)
-	pc.Set(isWikiKey, isWiki)
-	pc.Set(renderMetasKey, metas)
+// Write implements the standard Write interface:
+func (l *limitWriter) Write(data []byte) (int, error) {
+	leftToWrite := l.limit - l.sum
+	if leftToWrite < int64(len(data)) {
+		n, err := l.w.Write(data[:leftToWrite])
+		l.sum += int64(n)
+		if err != nil {
+			return n, err
+		}
+		return n, errors.New("rendered content too large - truncating render")
+	}
+	n, err := l.w.Write(data)
+	l.sum += int64(n)
+	return n, err
+}
+
+// newParserContext creates a parser.Context with the render context set
+func newParserContext(ctx *markup.RenderContext) parser.Context {
+	pc := parser.NewContext()
+	pc.Set(renderContextKey, ctx)
 	return pc
 }
 
-// render renders Markdown to HTML without handling special links.
-func render(body []byte, urlPrefix string, metas map[string]string, wikiMarkdown bool) []byte {
-	once.Do(func() {
-		converter = goldmark.New(
-			goldmark.WithExtensions(extension.Table,
-				extension.Strikethrough,
-				extension.TaskList,
-				extension.DefinitionList,
-				common.FootnoteExtension,
-				highlighting.NewHighlighting(
-					highlighting.WithFormatOptions(
-						chromahtml.WithClasses(true),
-						chromahtml.PreventSurroundingPre(true),
-					),
-					highlighting.WithWrapperRenderer(func(w util.BufWriter, c highlighting.CodeBlockContext, entering bool) {
-						if entering {
-							language, _ := c.Language()
-							if language == nil {
-								language = []byte("text")
-							}
+type GlodmarkRender struct {
+	ctx *markup.RenderContext
 
-							languageStr := string(language)
-
-							preClasses := []string{}
-							if languageStr == "mermaid" {
-								preClasses = append(preClasses, "is-loading")
-							}
-
-							if len(preClasses) > 0 {
-								_, err := w.WriteString(`<pre class="` + strings.Join(preClasses, " ") + `">`)
-								if err != nil {
-									return
-								}
-							} else {
-								_, err := w.WriteString(`<pre>`)
-								if err != nil {
-									return
-								}
-							}
-
-							// include language-x class as part of commonmark spec
-							_, err := w.WriteString(`<code class="chroma language-` + string(language) + `">`)
-							if err != nil {
-								return
-							}
-						} else {
-							_, err := w.WriteString("</code></pre>")
-							if err != nil {
-								return
-							}
-						}
-					}),
-				),
-				meta.Meta,
-			),
-			goldmark.WithParserOptions(
-				parser.WithAttribute(),
-				parser.WithAutoHeadingID(),
-				parser.WithASTTransformers(
-					util.Prioritized(&ASTTransformer{}, 10000),
-				),
-			),
-			goldmark.WithRendererOptions(
-				html.WithUnsafe(),
-			),
-		)
-
-		// Override the original Tasklist renderer!
-		converter.Renderer().AddOptions(
-			renderer.WithNodeRenderers(
-				util.Prioritized(NewHTMLRenderer(), 10),
-			),
-		)
-
-	})
-
-	pc := NewGiteaParseContext(urlPrefix, metas, wikiMarkdown)
-	var buf bytes.Buffer
-	if err := converter.Convert(giteautil.NormalizeEOL(body), &buf, parser.WithContext(pc)); err != nil {
-		log.Error("Unable to render: %v", err)
-	}
-	return markup.SanitizeReader(&buf).Bytes()
+	goldmarkMarkdown goldmark.Markdown
 }
 
-var (
-	// MarkupName describes markup's name
-	MarkupName = "markdown"
-)
+func (r *GlodmarkRender) Convert(source []byte, writer io.Writer, opts ...parser.ParseOption) error {
+	return r.goldmarkMarkdown.Convert(source, writer, opts...)
+}
+
+func (r *GlodmarkRender) highlightingRenderer(w util.BufWriter, c highlighting.CodeBlockContext, entering bool) {
+	if entering {
+		languageBytes, _ := c.Language()
+		languageStr := giteautil.IfZero(string(languageBytes), "text")
+
+		preClasses := "code-block"
+		if languageStr == "mermaid" || languageStr == "math" {
+			preClasses += " is-loading"
+		}
+
+		// include language-x class as part of commonmark spec, "chroma" class is used to highlight the code
+		// the "display" class is used by "js/markup/math.ts" to render the code element as a block
+		// the "math.ts" strictly depends on the structure: <pre class="code-block is-loading"><code class="language-math display">...</code></pre>
+		err := r.ctx.RenderInternal.FormatWithSafeAttrs(w, `<div class="code-block-container code-overflow-scroll"><pre class="%s"><code class="chroma language-%s display">`, preClasses, languageStr)
+		if err != nil {
+			return
+		}
+	} else {
+		_, err := w.WriteString("</code></pre></div>")
+		if err != nil {
+			return
+		}
+	}
+}
+
+type goldmarkEmphasisParser struct {
+	parser.InlineParser
+}
+
+func goldmarkNewEmphasisParser() parser.InlineParser {
+	return &goldmarkEmphasisParser{parser.NewEmphasisParser()}
+}
+
+func (s *goldmarkEmphasisParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
+	line, _ := block.PeekLine()
+	if len(line) > 1 && line[0] == '_' {
+		// a special trick to avoid parsing emphasis in filenames like "module/__init__.py"
+		end := bytes.IndexByte(line[1:], '_')
+		mark := bytes.Index(line, []byte("_.py"))
+		// check whether the "end" matches "_.py" or "__.py"
+		if mark != -1 && (end == mark || end == mark-1) {
+			return nil
+		}
+	}
+	return s.InlineParser.Parse(parent, block, pc)
+}
+
+func goldmarkDefaultParser() parser.Parser {
+	return parser.NewParser(parser.WithBlockParsers(parser.DefaultBlockParsers()...),
+		parser.WithInlineParsers([]util.PrioritizedValue{
+			util.Prioritized(parser.NewCodeSpanParser(), 100),
+			util.Prioritized(parser.NewLinkParser(), 200),
+			util.Prioritized(parser.NewAutoLinkParser(), 300),
+			util.Prioritized(parser.NewRawHTMLParser(), 400),
+			util.Prioritized(goldmarkNewEmphasisParser(), 500),
+		}...),
+		parser.WithParagraphTransformers(parser.DefaultParagraphTransformers()...),
+	)
+}
+
+// SpecializedMarkdown sets up the Gitea specific markdown extensions
+func SpecializedMarkdown(ctx *markup.RenderContext) *GlodmarkRender {
+	// TODO: it could use a pool to cache the renderers to reuse them with different contexts
+	// at the moment it is fast enough (see the benchmarks)
+	r := &GlodmarkRender{ctx: ctx}
+	r.goldmarkMarkdown = goldmark.New(
+		goldmark.WithParser(goldmarkDefaultParser()),
+		goldmark.WithExtensions(
+			extension.NewTable(extension.WithTableCellAlignMethod(extension.TableCellAlignAttribute)),
+			extension.Strikethrough,
+			extension.TaskList,
+			extension.DefinitionList,
+			common.FootnoteExtension,
+			highlighting.NewHighlighting(
+				highlighting.WithFormatOptions(
+					chromahtml.WithClasses(true),
+					chromahtml.PreventSurroundingPre(true),
+				),
+				highlighting.WithWrapperRenderer(r.highlightingRenderer),
+			),
+			math.NewExtension(&ctx.RenderInternal, math.Options{
+				Enabled:                  setting.Markdown.EnableMath,
+				ParseInlineDollar:        setting.Markdown.MathCodeBlockOptions.ParseInlineDollar,
+				ParseInlineParentheses:   setting.Markdown.MathCodeBlockOptions.ParseInlineParentheses, // this is a bad syntax "\( ... \)", it conflicts with normal markdown escaping
+				ParseBlockDollar:         setting.Markdown.MathCodeBlockOptions.ParseBlockDollar,
+				ParseBlockSquareBrackets: setting.Markdown.MathCodeBlockOptions.ParseBlockSquareBrackets, //  this is a bad syntax "\[ ... \]", it conflicts with normal markdown escaping
+			}),
+		),
+		goldmark.WithParserOptions(
+			parser.WithAttribute(),
+			parser.WithASTTransformers(util.Prioritized(NewASTTransformer(&ctx.RenderInternal), 10000)),
+		),
+		goldmark.WithRendererOptions(html.WithUnsafe()),
+	)
+
+	// Override the original Tasklist renderer!
+	r.goldmarkMarkdown.Renderer().AddOptions(
+		renderer.WithNodeRenderers(util.Prioritized(NewHTMLRenderer(&ctx.RenderInternal), 10)),
+	)
+
+	return r
+}
+
+// render calls goldmark render to convert Markdown to HTML
+// NOTE: The output of this method MUST get sanitized separately!!!
+func render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
+	converter := SpecializedMarkdown(ctx)
+	lw := &limitWriter{
+		w:     output,
+		limit: setting.UI.MaxDisplayFileSize * 3,
+	}
+
+	// FIXME: Don't read all to memory, but goldmark doesn't support
+	buf, err := io.ReadAll(input)
+	if err != nil {
+		log.Error("Unable to ReadAll: %v", err)
+		return err
+	}
+	buf = giteautil.NormalizeEOL(buf)
+
+	// FIXME: should we include a timeout to abort the renderer if it takes too long?
+	defer func() {
+		err := recover()
+		if err == nil {
+			return
+		}
+
+		log.Error("Panic in markdown: %v\n%s", err, log.Stack(2))
+		escapedHTML := template.HTMLEscapeString(giteautil.UnsafeBytesToString(buf))
+		_, _ = output.Write(giteautil.UnsafeStringToBytes(escapedHTML))
+	}()
+
+	pc := newParserContext(ctx)
+
+	// Preserve original length.
+	bufWithMetadataLength := len(buf)
+
+	rc := &RenderConfig{Meta: markup.RenderMetaAsDetails}
+	buf, _ = ExtractMetadataBytes(buf, rc)
+
+	metaLength := max(bufWithMetadataLength-len(buf), 0)
+	rc.metaLength = metaLength
+
+	pc.Set(renderConfigKey, rc)
+
+	if err := converter.Convert(buf, lw, parser.WithContext(pc)); err != nil {
+		log.Error("Unable to render: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// MarkupName describes markup's name
+var MarkupName = "markdown"
 
 func init() {
-	markup.RegisterParser(Parser{})
+	markup.RegisterRenderer(Renderer{})
 }
 
-// Parser implements markup.Parser
-type Parser struct{}
+type Renderer struct{}
 
-// Name implements markup.Parser
-func (Parser) Name() string {
+var _ markup.PostProcessRenderer = (*Renderer)(nil)
+
+func (Renderer) Name() string {
 	return MarkupName
 }
 
-// Extensions implements markup.Parser
-func (Parser) Extensions() []string {
-	return setting.Markdown.FileExtensions
+func (Renderer) NeedPostProcess() bool { return true }
+
+func (Renderer) FileNamePatterns() []string {
+	return setting.Markdown.FileNamePatterns
 }
 
-// Render implements markup.Parser
-func (Parser) Render(rawBytes []byte, urlPrefix string, metas map[string]string, isWiki bool) []byte {
-	return render(rawBytes, urlPrefix, metas, isWiki)
+func (Renderer) SanitizerRules() []setting.MarkupSanitizerRule {
+	return []setting.MarkupSanitizerRule{}
+}
+
+func (Renderer) Render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
+	return render(ctx, input, output)
 }
 
 // Render renders Markdown to HTML with all specific handling stuff.
-func Render(rawBytes []byte, urlPrefix string, metas map[string]string) []byte {
-	return markup.Render("a.md", rawBytes, urlPrefix, metas)
+func Render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
+	ctx.RenderOptions.MarkupType = MarkupName
+	return markup.Render(ctx, input, output)
+}
+
+// RenderString renders Markdown string to HTML with all specific handling stuff and return string
+func RenderString(ctx *markup.RenderContext, content string) (template.HTML, error) {
+	var buf strings.Builder
+	if err := Render(ctx, strings.NewReader(content), &buf); err != nil {
+		log.Warn("Unable to RenderString: %v, content: %s", err, giteautil.TruncateRunes(content, 200))
+		err = nil
+		return htmlutil.EscapeString(content), err
+	}
+	return template.HTML(buf.String()), nil
 }
 
 // RenderRaw renders Markdown to HTML without handling special links.
-func RenderRaw(body []byte, urlPrefix string, wikiMarkdown bool) []byte {
-	return render(body, urlPrefix, map[string]string{}, wikiMarkdown)
+func RenderRaw(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
+	rd, wr := io.Pipe()
+	defer func() {
+		_ = rd.Close()
+		_ = wr.Close()
+	}()
+
+	go func() {
+		if err := render(ctx, input, wr); err != nil {
+			_ = wr.CloseWithError(err)
+			return
+		}
+		_ = wr.Close()
+	}()
+
+	return markup.SanitizeReader(rd, "", output)
 }
 
-// RenderString renders Markdown to HTML with special links and returns string type.
-func RenderString(raw, urlPrefix string, metas map[string]string) string {
-	return markup.RenderString("a.md", raw, urlPrefix, metas)
-}
-
-// RenderWiki renders markdown wiki page to HTML and return HTML string
-func RenderWiki(rawBytes []byte, urlPrefix string, metas map[string]string) string {
-	return markup.RenderWiki("a.md", rawBytes, urlPrefix, metas)
-}
-
-// IsMarkdownFile reports whether name looks like a Markdown file
-// based on its extension.
-func IsMarkdownFile(name string) bool {
-	return markup.IsMarkupFile(name, MarkupName)
+// RenderRawString renders Markdown to HTML without handling special links and return string
+func RenderRawString(ctx *markup.RenderContext, content string) (string, error) {
+	var buf strings.Builder
+	if err := RenderRaw(ctx, strings.NewReader(content), &buf); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

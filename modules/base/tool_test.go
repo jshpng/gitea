@@ -1,28 +1,19 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package base
 
 import (
+	"crypto/sha1"
+	"fmt"
 	"testing"
+	"time"
+
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
 )
-
-func TestEncodeMD5(t *testing.T) {
-	assert.Equal(t,
-		"3858f62230ac3c915f300c664312c63f",
-		EncodeMD5("foobar"),
-	)
-}
-
-func TestEncodeSha1(t *testing.T) {
-	assert.Equal(t,
-		"8843d7f92416211de9ebb963ff4ce28125932878",
-		EncodeSha1("foobar"),
-	)
-}
 
 func TestEncodeSha256(t *testing.T) {
 	assert.Equal(t,
@@ -35,29 +26,55 @@ func TestShortSha(t *testing.T) {
 	assert.Equal(t, "veryverylo", ShortSha("veryverylong"))
 }
 
-func TestBasicAuthDecode(t *testing.T) {
-	_, _, err := BasicAuthDecode("?")
-	assert.Equal(t, "illegal base64 data at input byte 0", err.Error())
+func TestVerifyTimeLimitCode(t *testing.T) {
+	defer test.MockVariableValue(&setting.InstallLock, true)()
+	initGeneralSecret := func(secret string) {
+		setting.CfgProvider, _ = setting.NewConfigProviderFromData(fmt.Sprintf(`
+[security]
+INTERNAL_TOKEN = dummy
+INSTALL_LOCK = true
+[oauth2]
+JWT_SECRET = %s
+`, secret))
+		setting.LoadCommonSettings()
+	}
 
-	user, pass, err := BasicAuthDecode("Zm9vOmJhcg==")
-	assert.NoError(t, err)
-	assert.Equal(t, "foo", user)
-	assert.Equal(t, "bar", pass)
+	initGeneralSecret("KZb_QLUd4fYVyxetjxC4eZkrBgWM2SndOOWDNtgUUko")
+	now := time.Now()
 
-	_, _, err = BasicAuthDecode("aW52YWxpZA==")
-	assert.Error(t, err)
+	t.Run("TestGenericParameter", func(t *testing.T) {
+		time2000 := time.Date(2000, 1, 2, 3, 4, 5, 0, time.Local)
+		assert.Equal(t, "2000010203040000026fa5221b2731b7cf80b1b506f5e39e38c115fee5", CreateTimeLimitCode("test-sha1", 2, time2000, sha1.New()))
+		assert.Equal(t, "2000010203040000026fa5221b2731b7cf80b1b506f5e39e38c115fee5", CreateTimeLimitCode("test-sha1", 2, "200001020304", sha1.New()))
+		assert.Equal(t, "2000010203040000024842227a2f87041ff82025199c0187410a9297bf", CreateTimeLimitCode("test-hmac", 2, time2000, nil))
+		assert.Equal(t, "2000010203040000024842227a2f87041ff82025199c0187410a9297bf", CreateTimeLimitCode("test-hmac", 2, "200001020304", nil))
+	})
 
-	_, _, err = BasicAuthDecode("invalid")
-	assert.Error(t, err)
+	t.Run("TestInvalidCode", func(t *testing.T) {
+		assert.False(t, VerifyTimeLimitCode(now, "data", 2, ""))
+		assert.False(t, VerifyTimeLimitCode(now, "data", 2, "invalid code"))
+	})
+
+	t.Run("TestCreateAndVerify", func(t *testing.T) {
+		code := CreateTimeLimitCode("data", 2, now, nil)
+		assert.False(t, VerifyTimeLimitCode(now.Add(-time.Minute), "data", 2, code)) // not started yet
+		assert.True(t, VerifyTimeLimitCode(now, "data", 2, code))
+		assert.True(t, VerifyTimeLimitCode(now.Add(time.Minute), "data", 2, code))
+		assert.False(t, VerifyTimeLimitCode(now.Add(time.Minute), "DATA", 2, code))   // invalid data
+		assert.False(t, VerifyTimeLimitCode(now.Add(2*time.Minute), "data", 2, code)) // expired
+	})
+
+	t.Run("TestDifferentSecret", func(t *testing.T) {
+		// use another secret to ensure the code is invalid for different secret
+		verifyDataCode := func(c string) bool {
+			return VerifyTimeLimitCode(now, "data", 2, c)
+		}
+		code := CreateTimeLimitCode("data", 2, now, nil)
+		assert.True(t, verifyDataCode(code))
+		initGeneralSecret("000_QLUd4fYVyxetjxC4eZkrBgWM2SndOOWDNtgUUko")
+		assert.False(t, verifyDataCode(code))
+	})
 }
-
-func TestBasicAuthEncode(t *testing.T) {
-	assert.Equal(t, "Zm9vOmJhcg==", BasicAuthEncode("foo", "bar"))
-}
-
-// TODO: Test PBKDF2()
-// TODO: Test VerifyTimeLimitCode()
-// TODO: Test CreateTimeLimitCode()
 
 func TestFileSize(t *testing.T) {
 	var size int64 = 512
@@ -76,79 +93,20 @@ func TestFileSize(t *testing.T) {
 	assert.Equal(t, "2.0 EiB", FileSize(size))
 }
 
-func TestSubtract(t *testing.T) {
-	toFloat64 := func(n interface{}) float64 {
-		switch v := n.(type) {
-		case int:
-			return float64(v)
-		case int8:
-			return float64(v)
-		case int16:
-			return float64(v)
-		case int32:
-			return float64(v)
-		case int64:
-			return float64(v)
-		case float32:
-			return float64(v)
-		case float64:
-			return v
-		default:
-			return 0.0
-		}
-	}
-	values := []interface{}{
-		int(-3),
-		int8(14),
-		int16(81),
-		int32(-156),
-		int64(1528),
-		float32(3.5),
-		float64(-15.348),
-	}
-	for _, left := range values {
-		for _, right := range values {
-			expected := toFloat64(left) - toFloat64(right)
-			sub := Subtract(left, right)
-			assert.InDelta(t, expected, sub, 1e-3)
-		}
-	}
-}
-
-func TestEllipsisString(t *testing.T) {
-	assert.Equal(t, "...", EllipsisString("foobar", 0))
-	assert.Equal(t, "...", EllipsisString("foobar", 1))
-	assert.Equal(t, "...", EllipsisString("foobar", 2))
-	assert.Equal(t, "...", EllipsisString("foobar", 3))
-	assert.Equal(t, "f...", EllipsisString("foobar", 4))
-	assert.Equal(t, "fo...", EllipsisString("foobar", 5))
-	assert.Equal(t, "foobar", EllipsisString("foobar", 6))
-	assert.Equal(t, "foobar", EllipsisString("foobar", 10))
-}
-
-func TestTruncateString(t *testing.T) {
-	assert.Equal(t, "", TruncateString("foobar", 0))
-	assert.Equal(t, "f", TruncateString("foobar", 1))
-	assert.Equal(t, "fo", TruncateString("foobar", 2))
-	assert.Equal(t, "foo", TruncateString("foobar", 3))
-	assert.Equal(t, "foob", TruncateString("foobar", 4))
-	assert.Equal(t, "fooba", TruncateString("foobar", 5))
-	assert.Equal(t, "foobar", TruncateString("foobar", 6))
-	assert.Equal(t, "foobar", TruncateString("foobar", 7))
-}
-
 func TestStringsToInt64s(t *testing.T) {
 	testSuccess := func(input []string, expected []int64) {
 		result, err := StringsToInt64s(input)
 		assert.NoError(t, err)
 		assert.Equal(t, expected, result)
 	}
+	testSuccess(nil, nil)
 	testSuccess([]string{}, []int64{})
+	testSuccess([]string{""}, []int64{})
 	testSuccess([]string{"-1234"}, []int64{-1234})
-	testSuccess([]string{"1", "4", "16", "64", "256"},
-		[]int64{1, 4, 16, 64, 256})
+	testSuccess([]string{"1", "4", "16", "64", "256"}, []int64{1, 4, 16, 64, 256})
 
-	_, err := StringsToInt64s([]string{"-1", "a", "$"})
+	ints, err := StringsToInt64s([]string{"-1", "a"})
+	assert.Empty(t, ints)
 	assert.Error(t, err)
 }
 
@@ -159,102 +117,3 @@ func TestInt64sToStrings(t *testing.T) {
 		Int64sToStrings([]int64{1, 4, 16, 64, 256}),
 	)
 }
-
-func TestInt64sToMap(t *testing.T) {
-	assert.Equal(t, map[int64]bool{}, Int64sToMap([]int64{}))
-	assert.Equal(t,
-		map[int64]bool{1: true, 4: true, 16: true},
-		Int64sToMap([]int64{1, 4, 16}),
-	)
-}
-
-func TestIsLetter(t *testing.T) {
-	assert.True(t, IsLetter('a'))
-	assert.True(t, IsLetter('e'))
-	assert.True(t, IsLetter('q'))
-	assert.True(t, IsLetter('z'))
-	assert.True(t, IsLetter('A'))
-	assert.True(t, IsLetter('E'))
-	assert.True(t, IsLetter('Q'))
-	assert.True(t, IsLetter('Z'))
-	assert.True(t, IsLetter('_'))
-	assert.False(t, IsLetter('-'))
-	assert.False(t, IsLetter('1'))
-	assert.False(t, IsLetter('$'))
-}
-
-func TestDetectContentTypeLongerThanSniffLen(t *testing.T) {
-	// Pre-condition: Shorter than sniffLen detects SVG.
-	assert.Equal(t, "image/svg+xml", DetectContentType([]byte(`<!-- Comment --><svg></svg>`)))
-	// Longer than sniffLen detects something else.
-	assert.Equal(t, "text/plain; charset=utf-8", DetectContentType([]byte(`<!--
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
-Comment Comment Comment --><svg></svg>`)))
-}
-
-func TestIsTextFile(t *testing.T) {
-	assert.True(t, IsTextFile([]byte{}))
-	assert.True(t, IsTextFile([]byte("lorem ipsum")))
-}
-
-func TestIsSVGImageFile(t *testing.T) {
-	assert.True(t, IsSVGImageFile([]byte("<svg></svg>")))
-	assert.True(t, IsSVGImageFile([]byte("    <svg></svg>")))
-	assert.True(t, IsSVGImageFile([]byte(`<svg width="100"></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte("<svg/>")))
-	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?><svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<!-- Comment -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<!-- Multiple -->
-	<!-- Comments -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<!-- Multiline
-	Comment -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1 Basic//EN"
-	"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11-basic.dtd">
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-	<!-- Comment -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-	<!-- Multiple -->
-	<!-- Comments -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-	<!-- Multline
-	Comment -->
-	<svg></svg>`)))
-	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-	<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-	<!-- Multline
-	Comment -->
-	<svg></svg>`)))
-	assert.False(t, IsSVGImageFile([]byte{}))
-	assert.False(t, IsSVGImageFile([]byte("svg")))
-	assert.False(t, IsSVGImageFile([]byte("<svgfoo></svgfoo>")))
-	assert.False(t, IsSVGImageFile([]byte("text<svg></svg>")))
-	assert.False(t, IsSVGImageFile([]byte("<html><body><svg></svg></body></html>")))
-	assert.False(t, IsSVGImageFile([]byte(`<script>"<svg></svg>"</script>`)))
-	assert.False(t, IsSVGImageFile([]byte(`<!-- <svg></svg> inside comment -->
-	<foo></foo>`)))
-	assert.False(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-	<!-- <svg></svg> inside comment -->
-	<foo></foo>`)))
-}
-
-func TestFormatNumberSI(t *testing.T) {
-	assert.Equal(t, "125", FormatNumberSI(int(125)))
-	assert.Equal(t, "1.3k", FormatNumberSI(int64(1317)))
-	assert.Equal(t, "21.3M", FormatNumberSI(21317675))
-	assert.Equal(t, "45.7G", FormatNumberSI(45721317675))
-	assert.Equal(t, "", FormatNumberSI("test"))
-}
-
-// TODO: IsImageFile(), currently no idea how to test
-// TODO: IsPDFFile(), currently no idea how to test

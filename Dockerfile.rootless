@@ -1,38 +1,57 @@
+# syntax=docker/dockerfile:1
+# Build frontend on the native platform to avoid QEMU-related issues with nodejs ecosystem
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26-alpine3.23 AS frontend-build
+RUN apk --no-cache add build-base git nodejs pnpm
+WORKDIR /src
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile
+COPY --exclude=.git/ . .
+RUN make frontend
 
-###################################
-#Build stage
-FROM golang:1.15-alpine3.13 AS build-env
-
-ARG GOPROXY
-ENV GOPROXY ${GOPROXY:-direct}
+# Build backend for each target platform
+FROM docker.io/library/golang:1.26-alpine3.23 AS build-env
 
 ARG GITEA_VERSION
-ARG TAGS="sqlite sqlite_unlock_notify"
-ENV TAGS "bindata timetzdata $TAGS"
-ARG CGO_EXTRA_CFLAGS 
+ARG TAGS=""
+ENV TAGS="bindata timetzdata $TAGS"
+ARG CGO_EXTRA_CFLAGS
 
-#Build deps
-RUN apk --no-cache add build-base git nodejs npm
+# Build deps
+RUN apk --no-cache add \
+    build-base \
+    git
 
-#Setup repo
-COPY . ${GOPATH}/src/code.gitea.io/gitea
-WORKDIR ${GOPATH}/src/code.gitea.io/gitea
+WORKDIR ${GOPATH}/src/gitea.dev
+COPY go.mod go.sum ./
+RUN go mod download
+# See the comments in Dockerfile
+COPY --exclude=.git/ . .
+COPY --from=frontend-build /src/public/assets public/assets
 
-#Checkout version if set
-RUN if [ -n "${GITEA_VERSION}" ]; then git checkout "${GITEA_VERSION}"; fi \
- && make clean-all build
+# Build gitea, .git mount is required for version data
+RUN --mount=type=cache,target="/root/.cache/go-build" \
+    --mount=type=bind,source=".git/",target=".git/" \
+    make backend
 
-FROM alpine:3.13
-LABEL maintainer="maintainers@gitea.io"
+COPY docker/rootless /tmp/local
+
+# Set permissions for builds that made under windows which strips the executable bit from file
+RUN chmod 755 /tmp/local/usr/local/bin/* \
+              /go/src/gitea.dev/gitea
+
+FROM docker.io/library/alpine:3.23 AS gitea-rootless
 
 EXPOSE 2222 3000
 
 RUN apk --no-cache add \
     bash \
     ca-certificates \
+    dumb-init \
     gettext \
     git \
-    gnupg
+    curl \
+    gnupg \
+    openssh-keygen
 
 RUN addgroup \
     -S -g 1000 \
@@ -43,25 +62,27 @@ RUN addgroup \
     -s /bin/bash \
     -u 1000 \
     -G git \
-    git && \
-  echo "git:$(dd if=/dev/urandom bs=24 count=1 status=none | base64)" | chpasswd
+    git
 
 RUN mkdir -p /var/lib/gitea /etc/gitea
 RUN chown git:git /var/lib/gitea /etc/gitea
 
-COPY docker/rootless /
-COPY --from=build-env --chown=root:root /go/src/code.gitea.io/gitea/gitea /usr/local/bin/gitea
+COPY --from=build-env /tmp/local /
+COPY --from=build-env --chown=root:root /go/src/gitea.dev/gitea /app/gitea/gitea
 
-USER git:git
-ENV GITEA_WORK_DIR /var/lib/gitea
-ENV GITEA_CUSTOM /var/lib/gitea/custom
-ENV GITEA_TEMP /tmp/gitea
-#TODO add to docs the ability to define the ini to load (usefull to test and revert a config)
-ENV GITEA_APP_INI /etc/gitea/app.ini
-ENV HOME "/var/lib/gitea/git"
+# git:git
+USER 1000:1000
+ENV GITEA_WORK_DIR=/var/lib/gitea
+ENV GITEA_CUSTOM=/var/lib/gitea/custom
+ENV GITEA_TEMP=/tmp/gitea
+ENV TMPDIR=/tmp/gitea
+
+# TODO add to docs the ability to define the ini to load (useful to test and revert a config)
+ENV GITEA_APP_INI=/etc/gitea/app.ini
+ENV HOME="/var/lib/gitea/git"
 VOLUME ["/var/lib/gitea", "/etc/gitea"]
 WORKDIR /var/lib/gitea
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# HINT: HEALTH-CHECK-ENDPOINT: don't use HEALTHCHECK, search this hint keyword for more information
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD []
-

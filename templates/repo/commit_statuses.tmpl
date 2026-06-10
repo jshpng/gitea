@@ -1,14 +1,16 @@
-<a class="ui link commit-statuses-trigger">{{template "repo/commit_status" .Status}}</a>
-<div class="ui popup very wide fixed basic commit-statuses">
-	<div class="ui relaxed list divided">
-		{{range .Statuses}}
-			<div class="ui item singular-status">
-				<span>{{template "repo/commit_status" .}}</span>
-				<span class="ui">{{.Context}} <span class="text grey">{{.Description}}</span></span>
-				{{if .TargetURL}}
-					<div class="ui right"><a href="{{.TargetURL}}" target="_blank" rel="noopener noreferrer">{{$.root.i18n.Tr "repo.pulls.status_checks_details"}}</a></div>
-				{{end}}
-			</div>
-		{{end}}
+{{if .Statuses}}
+	{{if and (eq (len .Statuses) 1) .Status.TargetURL}}
+		<a class="flex-text-inline tw-no-underline {{.AdditionalClasses}}" data-global-init="initCommitStatuses" href="{{.Status.TargetURL}}">
+			{{template "repo/icons/commit_status" .Status}}
+		</a>
+	{{else}}
+		<span class="flex-text-inline {{.AdditionalClasses}}" data-global-init="initCommitStatuses" tabindex="0">
+			{{template "repo/icons/commit_status" .Status}}
+		</span>
+	{{end}}
+	<div class="tippy-target">
+		<div class="flex-divided-list items-px-default">
+			{{template "repo/pulls/status_items" (dict "CommitStatuses" .Statuses)}}
+		</div>
 	</div>
-</div>
+{{end}}

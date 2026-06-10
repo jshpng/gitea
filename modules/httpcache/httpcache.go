@@ -1,59 +1,108 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package httpcache
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
-// GetCacheControl returns a suitable "Cache-Control" header value
-func GetCacheControl() string {
-	if !setting.IsProd() {
-		return "no-store"
+type CacheControlOptions struct {
+	IsPublic bool
+	MaxAge   time.Duration
+}
+
+// SetCacheControlInHeader sets suitable cache-control headers in the response
+func SetCacheControlInHeader(h http.Header, opts *CacheControlOptions) {
+	directives := make([]string, 0, 4)
+
+	// "max-age=0 + must-revalidate" (aka "no-cache") is preferred instead of "no-store"
+	// because browsers may restore some input fields after navigate-back / reload a page.
+	publicPrivate := util.Iif(opts.IsPublic, "public", "private")
+	if setting.IsProd {
+		if opts.MaxAge == 0 {
+			directives = append(directives, "max-age=0", "private", "must-revalidate")
+		} else {
+			directives = append(directives, publicPrivate, "max-age="+strconv.Itoa(int(opts.MaxAge.Seconds())))
+		}
+	} else {
+		// use dev-related controls, and remind users they are using non-prod setting.
+		directives = append(directives, "max-age=0", publicPrivate, "must-revalidate")
+		h.Set("X-Gitea-Debug", fmt.Sprintf("RUN_MODE=%v, MaxAge=%s", setting.RunMode, opts.MaxAge))
 	}
-	return "private, max-age=" + strconv.FormatInt(int64(setting.StaticCacheTime.Seconds()), 10)
+	h.Set("Cache-Control", strings.Join(directives, ", "))
 }
 
-// generateETag generates an ETag based on size, filename and file modification time
-func generateETag(fi os.FileInfo) string {
-	etag := fmt.Sprint(fi.Size()) + fi.Name() + fi.ModTime().UTC().Format(http.TimeFormat)
-	return base64.StdEncoding.EncodeToString([]byte(etag))
+func CacheControlForPublicStatic() *CacheControlOptions {
+	return &CacheControlOptions{
+		IsPublic: true,
+		MaxAge:   setting.StaticCacheTime,
+	}
 }
 
-// HandleTimeCache handles time-based caching for a HTTP request
-func HandleTimeCache(req *http.Request, w http.ResponseWriter, fi os.FileInfo) (handled bool) {
-	ifModifiedSince := req.Header.Get("If-Modified-Since")
-	if ifModifiedSince != "" {
-		t, err := time.Parse(http.TimeFormat, ifModifiedSince)
-		if err == nil && fi.ModTime().Unix() <= t.Unix() {
+func CacheControlForPrivateStatic() *CacheControlOptions {
+	return &CacheControlOptions{
+		MaxAge: setting.StaticCacheTime,
+	}
+}
+
+// checkIfNoneMatchIsValid tests if the header If-None-Match matches the ETag
+func checkIfNoneMatchIsValid(req *http.Request, etag string) bool {
+	ifNoneMatch := req.Header.Get("If-None-Match")
+	if len(ifNoneMatch) > 0 {
+		for item := range strings.SplitSeq(ifNoneMatch, ",") {
+			item = strings.TrimPrefix(strings.TrimSpace(item), "W/") // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag#directives
+			if item == etag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func HandleGenericETagPublicCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time) bool {
+	return handleGenericETagTimeCache(req, w, etag, lastModified, CacheControlForPublicStatic())
+}
+
+func HandleGenericETagPrivateCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time) bool {
+	return handleGenericETagTimeCache(req, w, etag, lastModified, CacheControlForPrivateStatic())
+}
+
+// handleGenericETagTimeCache handles ETag-based caching with Last-Modified caching for the HTTP request.
+// It returns true if the request was handled.
+func handleGenericETagTimeCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time, cacheControlOpts *CacheControlOptions) (handled bool) {
+	if etag != "" {
+		w.Header().Set("Etag", etag)
+	}
+	if lastModified != nil && !lastModified.IsZero() {
+		// http.TimeFormat required a UTC time, refer to https://pkg.go.dev/net/http#TimeFormat
+		w.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
+	}
+
+	if etag != "" {
+		if checkIfNoneMatchIsValid(req, etag) {
 			w.WriteHeader(http.StatusNotModified)
 			return true
 		}
 	}
-
-	w.Header().Set("Cache-Control", GetCacheControl())
-	w.Header().Set("Last-Modified", fi.ModTime().Format(http.TimeFormat))
-	return false
-}
-
-// HandleEtagCache handles ETag-based caching for a HTTP request
-func HandleEtagCache(req *http.Request, w http.ResponseWriter, fi os.FileInfo) (handled bool) {
-	etag := generateETag(fi)
-	if req.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return true
+	if lastModified != nil && !lastModified.IsZero() {
+		ifModifiedSince := req.Header.Get("If-Modified-Since")
+		if ifModifiedSince != "" {
+			t, err := time.Parse(http.TimeFormat, ifModifiedSince)
+			if err == nil && lastModified.Unix() <= t.Unix() {
+				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
+		}
 	}
 
-	w.Header().Set("Cache-Control", GetCacheControl())
-	w.Header().Set("ETag", etag)
+	SetCacheControlInHeader(w.Header(), cacheControlOpts)
 	return false
 }

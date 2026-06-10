@@ -1,98 +1,35 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
 import (
 	"fmt"
 	"strings"
+
+	"gitea.dev/modules/git/foreachref"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/util"
 )
 
 // TagPrefix tags prefix path on the repository
 const TagPrefix = "refs/tags/"
 
-// IsTagExist returns true if given tag exists in the repository.
-func IsTagExist(repoPath, name string) bool {
-	return IsReferenceExist(repoPath, TagPrefix+name)
-}
-
 // CreateTag create one tag in the repository
 func (repo *Repository) CreateTag(name, revision string) error {
-	_, err := NewCommand("tag", "--", name, revision).RunInDir(repo.Path)
+	_, _, err := gitcmd.NewCommand("tag").AddDashesAndList(name, revision).WithDir(repo.Path).RunStdString(repo.Ctx)
 	return err
 }
 
 // CreateAnnotatedTag create one annotated tag in the repository
 func (repo *Repository) CreateAnnotatedTag(name, message, revision string) error {
-	_, err := NewCommand("tag", "-a", "-m", message, "--", name, revision).RunInDir(repo.Path)
+	_, _, err := gitcmd.NewCommand("tag", "-a", "-m").
+		AddDynamicArguments(message).
+		AddDashesAndList(name, revision).
+		WithDir(repo.Path).
+		RunStdString(repo.Ctx)
 	return err
-}
-
-func (repo *Repository) getTag(tagID SHA1, name string) (*Tag, error) {
-	t, ok := repo.tagCache.Get(tagID.String())
-	if ok {
-		log("Hit cache: %s", tagID)
-		tagClone := *t.(*Tag)
-		tagClone.Name = name // This is necessary because lightweight tags may have same id
-		return &tagClone, nil
-	}
-
-	tp, err := repo.GetTagType(tagID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get the commit ID and tag ID (may be different for annotated tag) for the returned tag object
-	commitIDStr, err := repo.GetTagCommitID(name)
-	if err != nil {
-		// every tag should have a commit ID so return all errors
-		return nil, err
-	}
-	commitID, err := NewIDFromString(commitIDStr)
-	if err != nil {
-		return nil, err
-	}
-
-	// If type is "commit, the tag is a lightweight tag
-	if ObjectType(tp) == ObjectCommit {
-		commit, err := repo.GetCommit(commitIDStr)
-		if err != nil {
-			return nil, err
-		}
-		tag := &Tag{
-			Name:    name,
-			ID:      tagID,
-			Object:  commitID,
-			Type:    tp,
-			Tagger:  commit.Committer,
-			Message: commit.Message(),
-			repo:    repo,
-		}
-
-		repo.tagCache.Set(tagID.String(), tag)
-		return tag, nil
-	}
-
-	// The tag is an annotated tag with a message.
-	data, err := NewCommand("cat-file", "-p", tagID.String()).RunInDirBytes(repo.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	tag, err := parseTagData(data)
-	if err != nil {
-		return nil, err
-	}
-
-	tag.Name = name
-	tag.ID = tagID
-	tag.repo = repo
-	tag.Type = tp
-
-	repo.tagCache.Set(tagID.String(), tag)
-	return tag, nil
 }
 
 // GetTagNameBySHA returns the name of a tag from its tag object SHA or commit SHA
@@ -101,13 +38,13 @@ func (repo *Repository) GetTagNameBySHA(sha string) (string, error) {
 		return "", fmt.Errorf("SHA is too short: %s", sha)
 	}
 
-	stdout, err := NewCommand("show-ref", "--tags", "-d").RunInDir(repo.Path)
+	stdout, _, err := gitcmd.NewCommand("show-ref", "--tags", "-d").WithDir(repo.Path).RunStdString(repo.Ctx)
 	if err != nil {
 		return "", err
 	}
 
-	tagRefs := strings.Split(stdout, "\n")
-	for _, tagRef := range tagRefs {
+	tagRefs := strings.SplitSeq(stdout, "\n")
+	for tagRef := range tagRefs {
 		if len(strings.TrimSpace(tagRef)) > 0 {
 			fields := strings.Fields(tagRef)
 			if strings.HasPrefix(fields[0], sha) && strings.HasPrefix(fields[1], TagPrefix) {
@@ -124,12 +61,12 @@ func (repo *Repository) GetTagNameBySHA(sha string) (string, error) {
 
 // GetTagID returns the object ID for a tag (annotated tags have both an object SHA AND a commit SHA)
 func (repo *Repository) GetTagID(name string) (string, error) {
-	stdout, err := NewCommand("show-ref", "--tags", "--", name).RunInDir(repo.Path)
+	stdout, _, err := gitcmd.NewCommand("show-ref", "--tags").AddDashesAndList(name).WithDir(repo.Path).RunStdString(repo.Ctx)
 	if err != nil {
 		return "", err
 	}
 	// Make sure exact match is used: "v1" != "release/v1"
-	for _, line := range strings.Split(stdout, "\n") {
+	for line := range strings.SplitSeq(stdout, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 2 && fields[1] == "refs/tags/"+name {
 			return fields[0], nil
@@ -157,56 +94,103 @@ func (repo *Repository) GetTag(name string) (*Tag, error) {
 	return tag, nil
 }
 
-// GetTagInfos returns all tag infos of the repository.
-func (repo *Repository) GetTagInfos(page, pageSize int) ([]*Tag, error) {
-	// TODO this a slow implementation, makes one git command per tag
-	stdout, err := NewCommand("tag").RunInDir(repo.Path)
+// GetTagWithID returns a Git tag by given name and ID
+func (repo *Repository) GetTagWithID(idStr, name string) (*Tag, error) {
+	id, err := NewIDFromString(idStr)
 	if err != nil {
 		return nil, err
 	}
 
-	tagNames := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
-
-	if page != 0 {
-		skip := (page - 1) * pageSize
-		if skip >= len(tagNames) {
-			return nil, nil
-		}
-		if (len(tagNames) - skip) < pageSize {
-			pageSize = len(tagNames) - skip
-		}
-		tagNames = tagNames[skip : skip+pageSize]
+	tag, err := repo.getTag(id, name)
+	if err != nil {
+		return nil, err
 	}
-
-	var tags = make([]*Tag, 0, len(tagNames))
-	for _, tagName := range tagNames {
-		tagName = strings.TrimSpace(tagName)
-		if len(tagName) == 0 {
-			continue
-		}
-
-		tag, err := repo.GetTag(tagName)
-		if err != nil {
-			return nil, err
-		}
-		tag.Name = tagName
-		tags = append(tags, tag)
-	}
-	sortTagsByTime(tags)
-	return tags, nil
+	return tag, nil
 }
 
-// GetTagType gets the type of the tag, either commit (simple) or tag (annotated)
-func (repo *Repository) GetTagType(id SHA1) (string, error) {
-	// Get tag type
-	stdout, err := NewCommand("cat-file", "-t", id.String()).RunInDir(repo.Path)
+// GetTagInfos returns all tag infos of the repository.
+func (repo *Repository) GetTagInfos(page, pageSize int) ([]*Tag, int, error) {
+	// Generally, refname:short should be equal to refname:lstrip=2 except core.warnAmbiguousRefs is used to select the strict abbreviation mode.
+	// https://git-scm.com/docs/git-for-each-ref#Documentation/git-for-each-ref.txt-refname
+	forEachRefFmt := foreachref.NewFormat("objecttype", "refname:lstrip=2", "object", "objectname", "creator", "contents", "contents:signature")
+
+	var tags []*Tag
+	var tagsTotal int
+	cmd := gitcmd.NewCommand("for-each-ref")
+	stdoutReader, stdoutReaderClose := cmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+	err := cmd.AddOptionFormat("--format=%s", forEachRefFmt.Flag()).
+		AddArguments("--sort", "-*creatordate", "refs/tags").
+		WithDir(repo.Path).
+		WithPipelineFunc(func(context gitcmd.Context) error {
+			parser := forEachRefFmt.Parser(stdoutReader)
+			for {
+				ref := parser.Next()
+				if ref == nil {
+					break
+				}
+
+				tag, err := parseTagRef(ref)
+				if err != nil {
+					return fmt.Errorf("GetTagInfos: parse tag: %w", err)
+				}
+				tags = append(tags, tag)
+			}
+			if err := parser.Err(); err != nil {
+				return fmt.Errorf("GetTagInfos: parse output: %w", err)
+			}
+
+			sortTagsByTime(tags)
+			tagsTotal = len(tags)
+			if page != 0 {
+				tags = util.PaginateSlice(tags, page, pageSize).([]*Tag)
+			}
+			return nil
+		}).
+		RunWithStderr(repo.Ctx)
+
+	return tags, tagsTotal, err
+}
+
+// parseTagRef parses a tag from a 'git for-each-ref'-produced reference.
+func parseTagRef(ref map[string]string) (tag *Tag, err error) {
+	tag = &Tag{
+		Type: ref["objecttype"],
+		Name: ref["refname:lstrip=2"],
+	}
+
+	tag.ID, err = NewIDFromString(ref["objectname"])
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("parse objectname '%s': %w", ref["objectname"], err)
 	}
-	if len(stdout) == 0 {
-		return "", ErrNotExist{ID: id.String()}
+
+	if tag.Type == "commit" {
+		// lightweight tag
+		tag.Object = tag.ID
+	} else {
+		// annotated tag
+		tag.Object, err = NewIDFromString(ref["object"])
+		if err != nil {
+			return nil, fmt.Errorf("parse object '%s': %w", ref["object"], err)
+		}
 	}
-	return strings.TrimSpace(stdout), nil
+
+	tag.Tagger = parseSignatureFromCommitLine(ref["creator"])
+	tag.MessageRaw = ref["contents"]
+
+	// strip any signature if present in contents field
+	_, tag.MessageRaw, _ = parsePayloadSignature(util.UnsafeStringToBytes(tag.MessageRaw), 0)
+
+	// annotated tag with GPG signature
+	if tag.Type == "tag" && ref["contents:signature"] != "" {
+		payload := fmt.Sprintf("object %s\ntype commit\ntag %s\ntagger %s\n\n%s", tag.Object, tag.Name, ref["creator"], tag.MessageRaw)
+		tag.Signature = &CommitSignature{
+			Signature: ref["contents:signature"],
+			Payload:   payload,
+		}
+	}
+
+	return tag, nil
 }
 
 // GetAnnotatedTag returns a Git tag by its SHA, must be an annotated tag

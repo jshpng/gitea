@@ -1,24 +1,24 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package admin
 
 import (
-	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/user"
-	"code.gitea.io/gitea/routers/api/v1/utils"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // CreateOrg api for create organization
-func CreateOrg(ctx *context.APIContext, form api.CreateOrgOption) {
+func CreateOrg(ctx *context.APIContext) {
 	// swagger:operation POST /admin/users/{username}/orgs admin adminCreateOrg
 	// ---
 	// summary: Create an organization
@@ -29,7 +29,7 @@ func CreateOrg(ctx *context.APIContext, form api.CreateOrgOption) {
 	// parameters:
 	// - name: username
 	//   in: path
-	//   description: username of the user that will own the created organization
+	//   description: username of the user who will own the created organization
 	//   type: string
 	//   required: true
 	// - name: organization
@@ -44,43 +44,40 @@ func CreateOrg(ctx *context.APIContext, form api.CreateOrgOption) {
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
-	u := user.GetUserByParams(ctx)
-	if ctx.Written() {
-		return
-	}
+	form := web.GetForm(ctx).(*api.CreateOrgOption)
 
 	visibility := api.VisibleTypePublic
 	if form.Visibility != "" {
-		visibility = api.VisibilityModes[form.Visibility]
+		visibility = api.VisibilityModes[string(form.Visibility)]
 	}
 
-	org := &models.User{
+	org := &organization.Organization{
 		Name:        form.UserName,
 		FullName:    form.FullName,
 		Description: form.Description,
 		Website:     form.Website,
 		Location:    form.Location,
 		IsActive:    true,
-		Type:        models.UserTypeOrganization,
+		Type:        user_model.UserTypeOrganization,
 		Visibility:  visibility,
 	}
 
-	if err := models.CreateOrganization(org, u); err != nil {
-		if models.IsErrUserAlreadyExist(err) ||
-			models.IsErrNameReserved(err) ||
-			models.IsErrNameCharsNotAllowed(err) ||
-			models.IsErrNamePatternNotAllowed(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+	if err := organization.CreateOrganization(ctx, org, ctx.ContextUser); err != nil {
+		if user_model.IsErrUserAlreadyExist(err) ||
+			db.IsErrNameReserved(err) ||
+			db.IsErrNameCharsNotAllowed(err) ||
+			db.IsErrNamePatternNotAllowed(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "CreateOrganization", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, convert.ToOrganization(org))
+	ctx.JSON(http.StatusCreated, convert.ToOrganization(ctx, org))
 }
 
-//GetAllOrgs API for getting information of all the organizations
+// GetAllOrgs API for getting information of all the organizations
 func GetAllOrgs(ctx *context.APIContext) {
 	// swagger:operation GET /admin/orgs admin adminGetAllOrgs
 	// ---
@@ -104,23 +101,23 @@ func GetAllOrgs(ctx *context.APIContext) {
 
 	listOptions := utils.GetListOptions(ctx)
 
-	users, maxResults, err := models.SearchUsers(&models.SearchUserOptions{
-		Type:        models.UserTypeOrganization,
-		OrderBy:     models.SearchOrderByAlphabetically,
+	users, maxResults, err := user_model.SearchUsers(ctx, user_model.SearchUserOptions{
+		Actor:       ctx.Doer,
+		Types:       []user_model.UserType{user_model.UserTypeOrganization},
+		OrderBy:     db.SearchOrderByAlphabetically,
 		ListOptions: listOptions,
 		Visible:     []api.VisibleType{api.VisibleTypePublic, api.VisibleTypeLimited, api.VisibleTypePrivate},
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "SearchOrganizations", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	orgs := make([]*api.Organization, len(users))
 	for i := range users {
-		orgs[i] = convert.ToOrganization(users[i])
+		orgs[i] = convert.ToOrganization(ctx, organization.OrgFromUser(users[i]))
 	}
 
-	ctx.SetLinkHeader(int(maxResults), listOptions.PageSize)
-	ctx.Header().Set("X-Total-Count", fmt.Sprintf("%d", maxResults))
-	ctx.Header().Set("Access-Control-Expose-Headers", "X-Total-Count, Link")
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
+	ctx.SetTotalCountHeader(maxResults)
 	ctx.JSON(http.StatusOK, &orgs)
 }

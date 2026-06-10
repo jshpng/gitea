@@ -1,20 +1,18 @@
 // Copyright 2018 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package recaptcha
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/setting"
 )
 
 // Response is the structure of JSON returned from API
@@ -25,19 +23,18 @@ type Response struct {
 	ErrorCodes  []ErrorCode `json:"error-codes"`
 }
 
-const apiURL = "api/siteverify"
-
 // Verify calls Google Recaptcha API to verify token
 func Verify(ctx context.Context, response string) (bool, error) {
 	post := url.Values{
 		"secret":   {setting.Service.RecaptchaSecret},
 		"response": {response},
 	}
+
+	reqURL := strings.TrimSuffix(setting.Service.RecaptchaURL, "/") + "/api/siteverify"
 	// Basically a copy of http.PostForm, but with a context
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		util.URLJoin(setting.Service.RecaptchaURL, apiURL), strings.NewReader(post.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(post.Encode()))
 	if err != nil {
-		return false, fmt.Errorf("Failed to create CAPTCHA request: %v", err)
+		return false, fmt.Errorf("Failed to create CAPTCHA request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -46,10 +43,11 @@ func Verify(ctx context.Context, response string) (bool, error) {
 		return false, fmt.Errorf("Failed to send CAPTCHA response: %s", err)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, fmt.Errorf("Failed to read CAPTCHA response: %s", err)
 	}
+
 	var jsonResponse Response
 	err = json.Unmarshal(body, &jsonResponse)
 	if err != nil {
