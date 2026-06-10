@@ -34,6 +34,11 @@ func ProtocolMiddlewares() (handlers []any) {
 		handlers = append(handlers, ForwardedHeadersHandler(setting.ReverseProxyLimit, setting.ReverseProxyTrustedProxies))
 	}
 
+	// the network guard must run after ForwardedHeadersHandler, so that it sees the real client IP
+	if networkGuardHandler := NetworkGuardHandler(); networkGuardHandler != nil {
+		handlers = append(handlers, networkGuardHandler)
+	}
+
 	handlers = append(handlers, routing.NewRequestInfoHandler())
 
 	if setting.IsAccessLogEnabled() {
@@ -49,6 +54,16 @@ func ProtocolMiddlewares() (handlers []any) {
 
 // SecurityHeadersHandler sets headers globally for every response that leaves Gitea.
 func SecurityHeadersHandler() func(http.Handler) http.Handler {
+	hstsValue := ""
+	if setting.Security.HSTSMaxAge > 0 {
+		hstsValue = fmt.Sprintf("max-age=%d", setting.Security.HSTSMaxAge)
+		if setting.Security.HSTSIncludeSubdomains {
+			hstsValue += "; includeSubDomains"
+		}
+		if setting.Security.HSTSPreload {
+			hstsValue += "; preload"
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 			if setting.Security.XContentTypeOptions != "unset" {
@@ -56,6 +71,15 @@ func SecurityHeadersHandler() func(http.Handler) http.Handler {
 			}
 			if setting.Security.XFrameOptions != "unset" {
 				resp.Header().Set("X-Frame-Options", setting.Security.XFrameOptions)
+			}
+			if hstsValue != "" {
+				resp.Header().Set("Strict-Transport-Security", hstsValue)
+			}
+			if setting.Security.ReferrerPolicy != "" {
+				resp.Header().Set("Referrer-Policy", setting.Security.ReferrerPolicy)
+			}
+			if setting.Security.PermissionsPolicy != "" {
+				resp.Header().Set("Permissions-Policy", setting.Security.PermissionsPolicy)
 			}
 			next.ServeHTTP(resp, req)
 		})

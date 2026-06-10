@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"gitea.dev/modules/auth/password/hash"
 	"gitea.dev/modules/generate"
@@ -18,6 +19,27 @@ var Security = struct {
 	// TODO: move more settings to this struct in future
 	XFrameOptions       string
 	XContentTypeOptions string
+
+	// Strict transport and content security headers, all of them are only sent when configured.
+	HSTSMaxAge            int // seconds, 0 disables the Strict-Transport-Security header
+	HSTSIncludeSubdomains bool
+	HSTSPreload           bool
+	ReferrerPolicy        string // empty disables the Referrer-Policy header
+	PermissionsPolicy     string // empty disables the Permissions-Policy header
+
+	// Network contains the "[security.network]" settings for protecting
+	// instances exposed to untrusted networks, see modules/netguard.
+	Network struct {
+		AllowedNetworks    string
+		BlockedNetworks    string
+		RateLimitEnabled   bool
+		RateLimitRequests  int
+		RateLimitWindow    time.Duration
+		AuthAutoBanEnabled bool
+		AuthBanMaxFailures int
+		AuthBanWindow      time.Duration
+		AuthBanDuration    time.Duration
+	}
 }{
 	XFrameOptions:       "SAMEORIGIN",
 	XContentTypeOptions: "nosniff",
@@ -197,4 +219,25 @@ func loadSecurityFrom(rootCfg ConfigProvider) {
 	if sectionHasDisableQueryAuthToken && !DisableQueryAuthToken {
 		log.Warn("Enabling Query API Auth tokens is not recommended. DISABLE_QUERY_AUTH_TOKEN will default to true in gitea 1.23 and will be removed in gitea 1.24.")
 	}
+
+	Security.HSTSMaxAge = sec.Key("HSTS_MAX_AGE").MustInt(0)
+	Security.HSTSIncludeSubdomains = sec.Key("HSTS_INCLUDE_SUBDOMAINS").MustBool(true)
+	Security.HSTSPreload = sec.Key("HSTS_PRELOAD").MustBool(false)
+	Security.ReferrerPolicy = sec.Key("REFERRER_POLICY").MustString("")
+	Security.PermissionsPolicy = sec.Key("PERMISSIONS_POLICY").MustString("")
+
+	loadSecurityNetworkFrom(rootCfg)
+}
+
+func loadSecurityNetworkFrom(rootCfg ConfigProvider) {
+	sec := rootCfg.Section("security.network")
+	Security.Network.AllowedNetworks = sec.Key("ALLOWED_NETWORKS").MustString("")
+	Security.Network.BlockedNetworks = sec.Key("BLOCKED_NETWORKS").MustString("")
+	Security.Network.RateLimitEnabled = sec.Key("RATE_LIMIT_ENABLED").MustBool(false)
+	Security.Network.RateLimitRequests = sec.Key("RATE_LIMIT_REQUESTS").MustInt(300)
+	Security.Network.RateLimitWindow = sec.Key("RATE_LIMIT_WINDOW").MustDuration(time.Minute)
+	Security.Network.AuthAutoBanEnabled = sec.Key("AUTH_AUTO_BAN_ENABLED").MustBool(false)
+	Security.Network.AuthBanMaxFailures = sec.Key("AUTH_BAN_MAX_FAILURES").MustInt(10)
+	Security.Network.AuthBanWindow = sec.Key("AUTH_BAN_WINDOW").MustDuration(10 * time.Minute)
+	Security.Network.AuthBanDuration = sec.Key("AUTH_BAN_DURATION").MustDuration(15 * time.Minute)
 }

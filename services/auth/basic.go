@@ -12,6 +12,7 @@ import (
 	user_model "gitea.dev/models/user"
 	"gitea.dev/modules/auth/httpauth"
 	"gitea.dev/modules/log"
+	"gitea.dev/modules/netguard"
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/timeutil"
 	"gitea.dev/modules/util"
@@ -140,7 +141,11 @@ func (b *Basic) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 	log.Trace("Basic Authorization: Attempting SignIn for %s", uname)
 	u, source, err := UserSignIn(req.Context(), uname, passwd)
 	if err != nil {
-		if !user_model.IsErrUserNotExist(err) {
+		if user_model.IsErrUserNotExist(err) {
+			// log a fail2ban-friendly message (like the web sign-in form does) and feed the auto-ban tracker
+			log.Warn("Failed authentication attempt for %s from %s: %v", uname, req.RemoteAddr, err)
+			netguard.RecordAuthFailure(req.RemoteAddr)
+		} else {
 			log.Error("UserSignIn: %v", err)
 		}
 		return nil, err
@@ -163,6 +168,8 @@ func (b *Basic) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 
 	store.GetData()["LoginMethod"] = BasicMethodName
 	log.Trace("Basic Authorization: Logged in user %-v", u)
+
+	netguard.ResetAuthFailures(req.RemoteAddr)
 
 	return u, nil
 }
