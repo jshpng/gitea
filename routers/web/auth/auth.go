@@ -19,6 +19,7 @@ import (
 	"gitea.dev/modules/eventsource"
 	"gitea.dev/modules/httplib"
 	"gitea.dev/modules/log"
+	"gitea.dev/modules/netguard"
 	"gitea.dev/modules/optional"
 	"gitea.dev/modules/session"
 	"gitea.dev/modules/setting"
@@ -307,6 +308,7 @@ func SignInPost(ctx *context.Context) {
 		if errors.Is(err, util.ErrNotExist) || errors.Is(err, util.ErrInvalidArgument) {
 			ctx.RenderWithErrDeprecated(ctx.Tr("form.username_password_incorrect"), tplSignIn, &form)
 			log.Warn("Failed authentication attempt for %s from %s: %v", form.UserName, ctx.RemoteAddr(), err)
+			netguard.RecordAuthFailure(ctx.RemoteAddr())
 		} else if user_model.IsErrEmailAlreadyUsed(err) {
 			ctx.RenderWithErrDeprecated(ctx.Tr("form.email_been_used"), tplSignIn, &form)
 			log.Warn("Failed authentication attempt for %s from %s: %v", form.UserName, ctx.RemoteAddr(), err)
@@ -319,6 +321,8 @@ func SignInPost(ctx *context.Context) {
 		}
 		return
 	}
+
+	netguard.ResetAuthFailures(ctx.RemoteAddr())
 
 	// Now handle 2FA:
 	// First of all if the source can skip local two fa we're done
